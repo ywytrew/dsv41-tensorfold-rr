@@ -1,7 +1,9 @@
-//! Exact prompt reuse for any family and backend: states kept at prompt-pass chunk ends, found by their tokens.
+//! Exact prompt reuse for any family and backend: states kept at prompt-pass chunk ends, found by their tokens and
+//! the images their tokens cover (an image's are placeholders: a state is resumed only among images equal to its own).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const imprint = @import("prompt_imprint.zig");
+const Image = @import("lanes").stream.Image;
 
 /// A family's copy of one state.
 pub const Saved = *anyopaque;
@@ -57,6 +59,7 @@ pub const Entry = struct {
     used: u64, // the store's clock at its last keep or resume
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+    mm: u64 = 0, // the images `tokens` cover (imageKey): a state resumes only among the same ones
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
@@ -120,22 +123,44 @@ pub const Store = struct {
         return at > 0 and (!s.rules.planned or std.mem.indexOfScalar(u32, starts, at) != null);
     }
 
-    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left.
-    pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
+    /// The images `n` tokens of a prompt cover: 0 when they cover none (so a state of a prompt's text-only prefix
+    /// matches any later request whose images all come after it), else the ordered fold of their content keys. A
+    /// state may only be resumed by a prompt with the same images in the same places: their placeholder tokens are
+    /// all the same id, so the tokens alone cannot tell two images apart.
+    fn imageKey(images: []const Image, n: usize) u64 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        var any = false;
+        for (images) |im| {
+            if (@as(usize, im.at) + im.tokens > n) continue;
+            any = true;
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, im.key, .little);
+            h.update(&b);
+        }
+        if (!any) return 0;
+        var d: [32]u8 = undefined;
+        h.final(&d);
+        return std.mem.readInt(u64, d[0..8], .little);
+    }
+
+    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, its images the prompt's
+    /// first ones, at least one row left.
+    pub fn find(s: *Store, prompt: []const u32, starts: []const u32, images: []const Image) ?*Entry {
         var best: ?*Entry = null;
         for (s.entries.items) |e| {
             if (e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
-            if (best != null and e.at <= best.?.at) continue;
             const n = e.tokens.len;
             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
+            if (e.mm != imageKey(images, n)) continue;
+            if (best != null and e.at <= best.?.at) continue; // the longest wins; one that did not match never does
             best = e;
         }
         return best;
     }
 
     /// Before a prompt pass: restore the longest state `prompt` resumes (from 0: none or a failed copy) and plan its marks.
-    pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque) !Plan {
-        const l = try s.lookup(a, prompt, history_len, shared, starts);
+    pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque, images: []const Image) !Plan {
+        const l = try s.lookup(a, prompt, history_len, shared, starts, images);
         const e = l.entry orelse return .{ .marks = l.marks };
         const ok = if (s.family.vtable.restore(s.family.ptr, owner, e.saved)) |_| true else |err| blk: {
             note("restoring {d} tokens failed ({s}); prefilling from the start", .{ e.at, @errorName(err) });
@@ -148,8 +173,8 @@ pub const Store = struct {
     }
 
     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
-    pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
-        const e = s.recall(prompt, starts, s.find(prompt, starts));
+    pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, images: []const Image) !Lookup {
+        const e = s.recall(prompt, starts, s.find(prompt, starts, images));
         if (e == null) s.counts.misses += 1;
         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
@@ -248,13 +273,14 @@ pub const Store = struct {
     }
 
     /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
-    pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
+    pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, images: []const Image) bool {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
-        for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
-            e.used = s.clock; // the same state again: no copy
+        const mm = imageKey(images, n);
+        for (s.entries.items) |e| if (e.at == at and e.mm == mm and std.mem.eql(u32, e.tokens, prompt[0..n])) {
+            e.used = s.clock; // the same state again: no copy (a state of other images is another state)
             e.shared = e.shared or shared;
             return true;
         };
@@ -293,7 +319,7 @@ pub const Store = struct {
             return s.fail(at, err);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
+        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .mm = mm };
         s.entries.append(s.gpa, e) catch {
             s.free(e);
             return s.fail(at, error.OutOfMemory);
@@ -360,9 +386,11 @@ pub const Store = struct {
         return have;
     }
 
-    /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
-    pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
+    /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds. A prompt
+    /// with images adds a line saying so: its states are keyed by the images too, which is worth seeing in the log.
+    pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64, images: usize) void {
         if (@import("builtin").is_test) return;
+        if (images > 0) std.log.info("prompt cache: this request carried {d} image{s}: the pass is keyed by their content, not skipped", .{ images, if (images == 1) "" else "s" });
         std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
     }
 

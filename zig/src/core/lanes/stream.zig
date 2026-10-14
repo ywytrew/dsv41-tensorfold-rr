@@ -103,6 +103,10 @@ pub const Image = struct {
     tokens: u32,
     bytes: []const u8,
     rows: bool = false,
+    /// The image's content key (a hash of the payload its family prepared, filled by the server): a prompt cache
+    /// state covers the images inside its span, so it is resumed only among images with the same keys. 0 = none
+    /// given, which keeps such a state out of reuse.
+    key: u64 = 0,
 };
 
 /// A vision family's image input as a server renders it (engine_api.Info.vision): each image part becomes

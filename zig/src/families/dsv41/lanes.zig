@@ -371,8 +371,8 @@ pub const Lanes = struct {
         var moved = false;
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
-            // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
-            if (s.images.len == 0 and self.usable(sn, len)) {
+            // (a kept state's images are part of its key: the store matched them, so it resumes like any other)
+            if (self.usable(sn, len)) {
                 kept = sn;
                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
             } else s.reuse_failed = true;
@@ -484,7 +484,7 @@ pub const Lanes = struct {
             }
             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
             start += n;
-            if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+            if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
         }
         if (!head) return error.NoPromptLogits;
         const logits = try m.promptLogitsHost();

@@ -52,7 +52,9 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         .ids => |ids| return .{ .ids = ids },
     };
     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
-    if (input.images.len > 0) return spans(srv, cx, prompt, input.images); // (no kept history: the cache keys tokens)
+    // an image request's cache state is keyed by its images' content too (spans fills each image's key): its history
+    // length is the history's own expansion, so a later turn may resume the prefix the images left untouched
+    if (input.images.len > 0) return spans(srv, cx, prompt, input.images, try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false));
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
@@ -61,8 +63,9 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
 }
 
 /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
-/// the payload the engine reads), the images in prompt order.
-fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) errors.Refused!Rendered {
+/// the payload the engine reads), the images in prompt order; each span's content key is the hash of that payload, and
+/// `history` (the same messages without the generation suffix) gives the prompt's history length.
+fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8, history: []const u32) errors.Refused!Rendered {
     const vision = srv.info.vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
     var out: std.ArrayList(u32) = .empty;
     var placed: std.ArrayList(api.Image) = .empty;
@@ -78,11 +81,32 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
             error.OutOfMemory => return error.OutOfMemory,
             error.BadImage => return cx.refuse(problem),
         };
-        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
+        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload, .key = contentKey(prep.payload) });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
     }
     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
-    return .{ .ids = out.items, .images = placed.items };
+    var history_len: usize = 0;
+    if (history.len > 0 and history.len < ids.len and std.mem.eql(u32, ids[0..history.len], history)) {
+        var n: usize = 0;
+        var k: usize = 0;
+        for (ids[0..history.len]) |id| {
+            if (id == vision.token) {
+                n += placed.items[k].tokens;
+                k += 1;
+            } else n += 1;
+        }
+        history_len = n;
+    }
+    return .{ .ids = out.items, .images = placed.items, .history_len = history_len };
+}
+
+/// An image's content key: the low 8 bytes of the SHA-256 of the payload its family prepared. The same picture in the
+/// same prepared form always hashes the same, and two different ones effectively never collide, so a kept state that
+/// covers an image may be resumed only when the request carries the same images in the same places.
+fn contentKey(payload: []const u8) u64 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &d, .{});
+    return std.mem.readInt(u64, d[0..8], .little);
 }
 
 /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.

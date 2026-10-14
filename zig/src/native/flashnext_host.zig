@@ -252,7 +252,7 @@ pub const Host = struct {
         fn marked(ctx: *anyopaque, at: usize) void {
             const c: *Ctx = @ptrCast(@alignCast(ctx));
             const t0 = c.h.now();
-            if (c.h.cache) |*store| if (store.keep(c.job.request.prompt, @intCast(at), null, c.job.request.chunks)) c.h.saved.append(c.h.gpa, @intCast(at)) catch {}; // held here: rank 1 keeps its copy
+            if (c.h.cache) |*store| if (store.keep(c.job.request.prompt, @intCast(at), null, c.job.request.chunks, c.job.request.images)) c.h.saved.append(c.h.gpa, @intCast(at)) catch {}; // held here: rank 1 keeps its copy
             c.job.keep_ns += c.h.now() - t0;
         }
 
@@ -314,14 +314,14 @@ pub const Host = struct {
         const kept0 = if (h.cache) |*store| store.counts.kept else 0;
         const t_begin = h.now();
         if (h.cache) |*store| if (r.prompt.len + r.max_tokens + fx.MARGIN <= tf.flashnext_replay.CAP) {
-            plan = store.begin(arena.allocator(), r.prompt, r.history_len, r.shared_prefixes, &.{}, null) catch .{};
+            plan = store.begin(arena.allocator(), r.prompt, r.history_len, r.shared_prefixes, &.{}, null, r.images) catch .{};
         };
         job.restore_ns = h.now() - t_begin;
         job.cached = plan.from;
         defer if (job.prefilled) |done| std.log.info("prompt pass: {d} -> {d} tokens in {d:.1} ms (waited {d:.1} ms; lookup and restore {d:.1} ms, peer handoff {d:.1} ms, keeps {d:.1} ms)", .{ job.cached, r.prompt.len, ms(done - job.began), ms(job.began - job.queued), ms(job.restore_ns), ms(h.eng.handoff_ns), ms(job.keep_ns) });
         h.prompt = r.prompt;
         h.saved.clearRetainingCapacity();
-        defer if (h.cache) |*store| store.report(r.prompt.len, job.cached, store.counts.kept - kept0);
+        defer if (h.cache) |*store| store.report(r.prompt.len, job.cached, store.counts.kept - kept0, r.images.len);
         defer if (h.eng.r.tp != null) for (plan.marks) |mk| if (std.mem.indexOfScalar(u32, h.saved.items, mk) == null) {
             h.eng.peer_drops.append(h.gpa, fx.keyOf(r.prompt[0 .. mk + 1])) catch {}; // rank 1 kept it, this Mac didn't
         };
