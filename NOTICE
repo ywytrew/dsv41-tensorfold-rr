@@ -50,3 +50,35 @@ Modified upstream files:
   THIRD_PARTY_NOTICES.md           the DeepSeek-V4.1 section
 
 The "git log" of this branch and tools/dsv41-zig/ATTRIBUTION.md describe the changes and their sources.
+
+Additional modifications in ywytrew/dsv41-tensorfold-rr (2026-10-17)
+----------------------------------------------------------------
+Copyright 2026 ywytrew. Modifications licensed under Apache-2.0.
+Based on Bertholomus AI (Albert Lee)'s deepseek-v41-zig branch, commit
+dfc8fe50af303fcbdda0e839cae3a18eb53be2e1, retaining TensorFold's prior notices.
+This fork adds/retains local image-content cache keys, metrics compatibility,
+prefix-cache extent conflict repair, cooperative chunked prefill, an optional
+single-pending-prefill policy, tests, and portable launch examples.
+It does not claim authorship of the upstream engine or DSV41 model implementation.
+The source files changed from that public baseline are:
+  zig/src/core/lane_host.zig
+  zig/src/core/lane_host_prefill_test.zig
+  zig/src/core/lanes/backend.zig
+  zig/src/core/lanes/engine.zig
+  zig/src/core/lanes/stream.zig
+  zig/src/core/prompt_cache.zig
+  zig/src/core/prompt_cache_test.zig
+  zig/src/families/dsv41/lanes.zig
+  zig/src/families/dsv41/native.zig
+  zig/src/native/cuda.zig
+  zig/src/native/flashnext_host.zig
+  zig/src/server/chat.zig
+  zig/src/server/metrics.zig
+  zig/src/server/prompt.zig
+  zig/src/server/server.zig
+  zig/src/server/status_routes.zig
+
+README.md is replaced by this fork's guide; its previous content is preserved in
+README.upstream.md. New documentation and scripts are in CREDITS.md,
+docs/dsv41-rr/ and tools/dsv41-rr/. .gitignore adds local build-output exclusions.
+See CREDITS.md and docs/dsv41-rr/CHANGES.md for the modification boundaries.

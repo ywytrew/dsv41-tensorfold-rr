@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! Exact prompt reuse for any family and backend: states kept at prompt-pass chunk ends, found by their tokens and
 //! the images their tokens cover (an image's are placeholders: a state is resumed only among images equal to its own).
 const std = @import("std");

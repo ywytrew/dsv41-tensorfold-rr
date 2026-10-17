@@ -1,0 +1,26 @@
+{
+  "original": {
+    "requests": 8,
+    "payload_hashes_recomputed": true,
+    "output_hashes_recomputed": true,
+    "cross_mode_full_output_and_token_hashes_match": true,
+    "restore_failed_max": 0,
+    "exclusive_phases": 2
+  },
+  "rr": {
+    "requests": 8,
+    "payload_hashes_recomputed": true,
+    "output_hashes_recomputed": true,
+    "cross_mode_full_output_and_token_hashes_match": true,
+    "restore_failed_max": 0,
+    "exclusive_phases": 2
+  },
+  "single": {
+    "requests": 8,
+    "payload_hashes_recomputed": true,
+    "output_hashes_recomputed": true,
+    "cross_mode_full_output_and_token_hashes_match": true,
+    "restore_failed_max": 0,
+    "exclusive_phases": 2
+  }
+}

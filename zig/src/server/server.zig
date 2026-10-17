@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! The server: one engine and tokenizer behind the HTTP routes, one thread a connection.
 const std = @import("std");
 const api = @import("engine_api");
@@ -205,10 +208,10 @@ pub const Server = struct {
     }
 
     /// Counts one finished request for /metrics.
-    pub fn noteRequest(srv: *Server, prompt_len: usize, generated: usize, drafted: u64, accepted: u64, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
+    pub fn noteRequest(srv: *Server, prompt_len: usize, cached: u32, generated: usize, drafted: u64, accepted: u64, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
         const now = clock.nowNs(srv.io);
         const tpot = srv.metrics.tpotValue(first, last, generated);
-        srv.metrics.note(srv.io, prompt_len, generated, drafted, accepted, rounds, @max(0, clock.seconds(now - received)), if (first) |f| clock.seconds(f - received) else null, if (first) |f| @max(0, clock.seconds(now - f)) else null, prefill, tpot);
+        srv.metrics.note(srv.io, prompt_len, cached, generated, drafted, accepted, rounds, @max(0, clock.seconds(now - received)), if (first) |f| clock.seconds(f - received) else null, if (first) |f| @max(0, clock.seconds(now - f)) else null, prefill, tpot);
     }
 
     /// Accepts connections until ``stop`` is set, each on its own thread.

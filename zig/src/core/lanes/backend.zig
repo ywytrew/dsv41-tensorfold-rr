@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! What the round loop asks a backend (Metal, CUDA or the fake) to compute; drawn tokens stay on the GPU behind handles.
 const std = @import("std");
 const Stream = @import("stream.zig").Stream;
@@ -49,6 +52,14 @@ pub const Backend = struct {
     pub const VTable = struct {
         /// Prefill the stream's prompt into its caches (and its draft head's).
         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
+        /// Optional bounded prompt pass. First call places/restores the stream; later calls resume it.
+        /// false: owns its lane but is NOT decode-ready. true: first() is ready. release() also cancels a partial pass.
+        /// A call must consume reuse.saved before returning (other admissions may evict it).
+        prefill_step: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
+        /// Decode rounds between prompt chunks while both kinds of work exist; legacy default is one.
+        prefill_decode_rounds: u32 = 1,
+        /// Admit at most one unfinished prompt; already-ready streams still decode between chunks.
+        prefill_serial: bool = false,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.

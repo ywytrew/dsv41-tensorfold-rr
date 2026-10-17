@@ -1,0 +1,33 @@
+{
+  "dry_run_only": true,
+  "model_started": false,
+  "matrix": [
+    {
+      "variant": "single",
+      "rank": 0,
+      "default_command_checked": true,
+      "context_override_checked": true
+    },
+    {
+      "variant": "single",
+      "rank": 1,
+      "default_command_checked": true,
+      "context_override_checked": true
+    },
+    {
+      "variant": "dual",
+      "rank": 0,
+      "default_command_checked": true,
+      "context_override_checked": true
+    },
+    {
+      "variant": "dual",
+      "rank": 1,
+      "default_command_checked": true,
+      "context_override_checked": true
+    }
+  ],
+  "key_file_argument_checked": true,
+  "port8001_rejected": true,
+  "bash_syntax_checked": true
+}

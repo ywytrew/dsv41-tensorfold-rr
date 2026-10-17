@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! Flash Next behind the native server: one reply at a time on the replay engine (prompt chunks, then GPU-side
 //! rounds), greedy only; the engine's thread owns the GPU, requests wait in arrival order (foreground first).
 const std = @import("std");

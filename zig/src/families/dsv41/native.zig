@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! DeepSeek-V4.1-Flash behind the native CUDA family interface, tensor parallel over two GPUs: the server's process is
 //! rank 0 (the lane core over lanes.zig's Backend on model.zig), rank 1 is `tf-dsv41-lanes` following it on the other
 //! node (the same model directory, rank cache, kit, pool and port). The ranks link over TCP and NCCL; the inputs
@@ -142,6 +145,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     });
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+    st.lanes.interleave = if (getenv("TF_DS_PREFILL_INTERLEAVE")) |v| std.mem.eql(u8, v, "1") else false;
+    st.lanes.serial_prefill = if (getenv("TF_DS_PREFILL_SERIAL")) |v| std.mem.eql(u8, v, "1") else false;
+    st.lanes.trace_prefill = if (getenv("TF_DS_PREFILL_TRACE")) |v| std.mem.eql(u8, v, "1") else false;
+    if (st.lanes.interleave) std.log.info("dsv41 chunked prefill enabled: text, 2048 tokens per turn; shared GPU stream", .{});
+    if (st.lanes.interleave) std.log.info("dsv41 prefill admission: {s}", .{if (st.lanes.serial_prefill) "single pending prompt" else "round robin"});
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
     st.vision = null;

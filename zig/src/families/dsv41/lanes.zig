@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! DeepSeek-V4.1-Flash behind TensorFold 1.0's lane core (core/lanes): the round loop picks each round's streams and
 //! windows and keeps the accepted rows; this backend runs them on the port's model (model.zig) with the served lane's
 //! arithmetic. Each stream has a pool slot (its window rings, positional stores and drafter rings) and an extent of
@@ -37,7 +40,7 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -207,6 +210,7 @@ const Lane = struct {
     base: usize,
     end: usize,
     first: u64 = 0, // the prompt's draw (a handle)
+    prefill_at: usize = 0, // next chunk; only read while the host keeps this stream out of decode
     held: [draft.max_block]u32 = undefined,
     confs: [draft.max_block]f32 = undefined,
     nheld: usize = 0,
@@ -219,6 +223,13 @@ extern "c" fn exp(x: f64) f64;
 /// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
 /// and the prompt runs from 0).
 pub const Snap = struct { id: u64, at: usize, base: usize, buf: cuda.DeviceBuffer, stale: bool = false };
+
+/// A resumed stream may overwrite its tail only if no other retained prefix owns it.
+/// Older checkpoints ending at or before lo remain valid and need no relocation.
+fn keptClashes(snaps: []const *Snap, lo: usize, hi: usize, except: *const Snap) bool {
+    for (snaps) |sn| if (sn != except and !sn.stale and lo < sn.base + sn.at and sn.base < hi) return true;
+    return false;
+}
 
 /// First tokens a handle names (each prompt's draw, read back right after its prefill).
 const ring = 1024;
@@ -242,6 +253,11 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
+    interleave: bool = false,
+    serial_prefill: bool = false, // opt-in candidate: text prompts yield at 2048-token boundaries
+    trace_prefill: bool = false,
+    active_fill: ?usize = null, // owner of shared prompt workspace and Engram read-ahead
+    interleaved_vtable: be.Backend.VTable = undefined,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -266,7 +282,7 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = &.{
+        const base: be.Backend = .{ .ptr = self, .vtable = &.{
             .prefill = prefillFn,
             .first = firstFn,
             .queue = queueFn,
@@ -277,6 +293,12 @@ pub const Lanes = struct {
             .probabilities = probabilitiesFn,
             .release = releaseFn,
         } };
+        if (!self.interleave) return base;
+        self.interleaved_vtable = base.vtable.*;
+        self.interleaved_vtable.prefill_step = prefillStepFn;
+        self.interleaved_vtable.prefill_decode_rounds = 8;
+        self.interleaved_vtable.prefill_serial = self.serial_prefill;
+        return .{ .ptr = self, .vtable = &self.interleaved_vtable };
     }
 
     /// The facts the round loop reads: windows of the pending row and up to the drafter's block, several streams'
@@ -341,15 +363,10 @@ pub const Lanes = struct {
 
     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
     /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
-    fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+    fn preparePrefill(ptr: *anyopaque, s: *lanes.Stream) anyerror!usize {
         const self = of(ptr);
         const m = self.m;
         const gpa = self.gpa;
-        const t0 = m.now();
-        defer if (self.prof) |*p| {
-            p.prefill += m.now() - t0;
-            p.prefills += 1;
-        };
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
@@ -374,19 +391,30 @@ pub const Lanes = struct {
             // (a kept state's images are part of its key: the store matched them, so it resumes like any other)
             if (self.usable(sn, len)) {
                 kept = sn;
-                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
-            } else s.reuse_failed = true;
+                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or
+                    keptClashes(self.snaps.items, sn.base + sn.at, sn.base + size, sn);
+            } else {
+                s.reuse_failed = true;
+                std.log.warn("dsv41 prompt cache: restore unavailable (id {d}, stale {}, base {d}, at {d}, prompt {d})", .{ sn.id, sn.stale, sn.base, sn.at, len });
+            }
         }
-        const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size);
-        if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+        const base = if (kept != null and !moved) kept.?.base else self.placeKept(taken[0..nt], size, kept) catch |err| blk: {
+            if (err != error.KeptExtentFull) return err;
+            // Even after evicting other idle snapshots, source and destination cannot
+            // coexist. Explicitly give up this restore before reclaiming its source.
+            const sn = kept.?;
+            std.log.warn("dsv41 prompt cache: restore unavailable (pool pressure, id {d}, at {d}, extent {d}, pool {d})", .{ sn.id, sn.at, size, m.pool_cap });
+            sn.stale = true;
             kept = null;
             s.reuse_failed = true;
+            break :blk try self.placeKept(taken[0..nt], size, null);
         };
         // the rows this stream writes are no other kept state's
         self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
         self.used[slot] = true;
         errdefer {
+            self.pauseFill();
             _ = self.streams.remove(s);
             self.used[slot] = false;
         }
@@ -427,7 +455,9 @@ pub const Lanes = struct {
             try self.wire.ids(gpa, seq.items);
             try self.flush();
         }
+        self.pauseFill();
         try m.fillBegin(slot, base);
+        self.active_fill = slot;
         if (spans.items.len > 0) {
             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
             // the ids of a full pool)
@@ -448,7 +478,6 @@ pub const Lanes = struct {
             }
             try m.setImages(spans.items, rows.items);
         }
-        const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
             if (try self.begin(.snap_restore)) {
@@ -459,11 +488,38 @@ pub const Lanes = struct {
                 try self.wire.int(gpa, u64, sn.at);
                 try self.flush();
             }
-            if (base != sn.base) try m.copyExtent(sn.base, base, sn.at);
+            const source_base = sn.base;
+            if (base != source_base) try m.copyExtent(source_base, base, sn.at);
             try m.snapCopy(slot, sn.buf.ptr, false);
+            // The follower receives explicit from/to coordinates, so its saved ring
+            // needs no metadata update. Publish the new location only after both
+            // ranks' restore operations have been issued in stream order. Live
+            // readers and sibling snapshots independently retain the old extent.
+            if (base != source_base) {
+                sn.base = base;
+                std.log.info("dsv41 prompt cache: relocated id {d}, {d} tokens, base {d} -> {d}", .{ sn.id, sn.at, source_base, base });
+            }
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
+        return start;
+    }
+
+    fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+        const self = of(ptr);
+        const m = self.m;
+        const gpa = self.gpa;
+        const t0 = m.now();
+        defer if (self.prof) |*p| {
+            p.prefill += m.now() - t0;
+            p.prefills += 1;
+        };
+        var start = try preparePrefill(ptr, s);
+        errdefer releaseFn(ptr, s);
+        const lane = self.streams.get(s).?;
+        const seq = &self.seqs[lane.slot];
+        const len = seq.items.len;
+        const replay = len -| m.cfg.window;
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
@@ -495,6 +551,78 @@ pub const Lanes = struct {
         }
         const token = try draw(logits, len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
+        self.active_fill = null;
+    }
+
+    /// Join before another stream or decode reuses the single Engram staging area.
+    /// Consecutive chunks of a solo request do not join here: original read-ahead overlap is retained.
+    fn pauseFill(self: *Lanes) void {
+        self.m.joinAhead();
+        self.m.fill_seq = &.{};
+        self.active_fill = null;
+    }
+
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+        const self = of(ptr);
+        const m = self.m;
+        const gpa = self.gpa;
+        if (s.isCancelled()) return error.Cancelled;
+        // Image embeddings currently have one staging buffer. Keep their original synchronous
+        // path until per-request image staging has been validated; never silently mix their spans.
+        if (s.images.len > 0) {
+            try prefillFn(ptr, s);
+            return true;
+        }
+        if (!self.streams.contains(s)) {
+            const start = try preparePrefill(ptr, s);
+            self.streams.getPtr(s).?.prefill_at = start;
+        }
+        const lane = self.streams.get(s).?;
+        const seq = &self.seqs[lane.slot];
+        const len = seq.items.len;
+        const start = lane.prefill_at;
+        const replay = len -| m.cfg.window;
+        if (self.active_fill == null or self.active_fill.? != lane.slot) {
+            self.pauseFill();
+            if (try self.begin(.fill_resume)) {
+                try self.wire.int(gpa, u32, @intCast(lane.slot));
+                try self.wire.int(gpa, u64, lane.base);
+                try self.flush();
+            }
+            try m.fillBegin(lane.slot, lane.base); // changes views, NEVER resets per-slot caches
+            self.active_fill = lane.slot;
+        }
+        m.fill_seq = seq.items;
+        const n = @min(model.chunk_rows, len - start);
+        if (try self.begin(.fill_chunk)) {
+            try self.wire.int(gpa, u64, start);
+            try self.wire.int(gpa, u32, @intCast(n));
+            try self.wire.int(gpa, u64, replay);
+            try self.flush();
+        }
+        const t0 = m.now();
+        const head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+        const end = start + n;
+        self.streams.getPtr(s).?.prefill_at = end;
+        if (self.trace_prefill) std.log.info("dsv41 prefill chunk: slot {d}, base {d}, start {d}, end {d}, total {d}", .{ lane.slot, lane.base, start, end, len });
+        if (self.prof) |*p| {
+            p.prefill += m.now() - t0;
+            if (end == len) p.prefills += 1;
+        }
+        const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
+        if (s.reuse.hook) |k| if (end < len and end <= replay and (end == last_end or markEnds(s.reuse.marks, end))) k.at(k.ptr, s, @intCast(end));
+        if (end < len) return false;
+        if (!head) return error.NoPromptLogits;
+        // Consume the last logits before a different prompt overwrites shared head_g.
+        const logits = try m.promptLogitsHost();
+        if (logits_sha) {
+            var dg: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
+            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
+        }
+        self.streams.getPtr(s).?.first = self.take(try draw(logits, len, s.sampling));
+        self.pauseFill();
+        return true;
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -519,6 +647,7 @@ pub const Lanes = struct {
     /// row drawn at its keyed position.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
+        self.pauseFill();
         const m = self.m;
         const gpa = self.gpa;
         if (windows.len > max_streams) return error.WindowTooWide;
@@ -553,6 +682,9 @@ pub const Lanes = struct {
         const t1 = m.now();
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
+        if (self.trace_prefill) {
+            for (wins[0..windows.len]) |w| std.log.info("dsv41 decode round: slot {d}, start {d}, rows {d}", .{ w.slot, w.start, w.ids.len });
+        }
         const t2 = m.now();
         // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
         var greedy = true;
@@ -597,6 +729,7 @@ pub const Lanes = struct {
     /// One drafter pass for every stream asked: its pending token at its new length, `depth` drafts held.
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
+        self.pauseFill();
         const m = self.m;
         const gpa = self.gpa;
         if (m.dr == null) return error.NoDraftHead;
@@ -676,7 +809,10 @@ pub const Lanes = struct {
 
     /// The first extent that fits around the live streams and the kept states; the oldest kept states go stale
     /// until it does.
-    fn placeKept(self: *Lanes, live: []const [2]usize, size: usize) !usize {
+    fn placeKept(self: *Lanes, live: []const [2]usize, size: usize, source: ?*Snap) !usize {
+        // A live-stream capacity refusal will be retried by the host; do not destroy
+        // retained states while waiting for those streams to finish.
+        if (place(live, size, self.m.pool_cap) == null) return error.ContextFull;
         const gpa = self.gpa;
         var used: std.ArrayList([2]usize) = .empty;
         defer used.deinit(gpa);
@@ -686,8 +822,8 @@ pub const Lanes = struct {
             for (self.snaps.items) |sn| if (!sn.stale) try used.append(gpa, .{ sn.base, sn.base + sn.at });
             if (place(used.items, size, self.m.pool_cap)) |b| return b;
             const oldest = for (self.snaps.items) |sn| {
-                if (!sn.stale) break sn;
-            } else return error.ContextFull;
+                if (!sn.stale and sn != source) break sn;
+            } else return if (source != null) error.KeptExtentFull else error.ContextFull;
             oldest.stale = true;
         }
     }
@@ -746,6 +882,7 @@ pub const Lanes = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.streams.fetchRemove(s) orelse return;
+        if (self.active_fill == kv.value.slot) self.pauseFill();
         self.used[kv.value.slot] = false;
     }
 };
@@ -802,6 +939,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             7 => .snap_drop,
             8 => .fill_images,
             9 => .done,
+            10 => .fill_resume,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
@@ -818,6 +956,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                m.fill_seq = seqs[slot].items;
+            },
+            .fill_resume => {
+                slot = try r.int(u32);
+                const base = try r.int(u64);
+                if (slot >= max_streams) return error.BadSlot;
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
@@ -933,6 +1078,50 @@ test "extents take the first chunk-aligned gap" {
     try std.testing.expectEqual(@as(?usize, 8192), place(&used, 4096, 1 << 20));
     try std.testing.expectEqual(@as(?usize, 0), place(&.{}, 2048, 2048));
     try std.testing.expectEqual(@as(?usize, null), place(&used, 4096, 10240));
+}
+
+test "fixed prompt restore tail must not invalidate its adjacent retained conversation" {
+    var a: Snap = .{ .id = 1, .base = 0, .at = 190464, .buf = undefined };
+    var b: Snap = .{ .id = 2, .base = 190464, .at = 188416, .buf = undefined };
+    const snaps = [_]*Snap{ &a, &b };
+    try std.testing.expect(keptClashes(&snaps, a.base + a.at, 192512, &a));
+    try std.testing.expect(!keptClashes(&snaps, b.base + b.at, b.base + 190464, &b));
+    b.stale = true;
+    try std.testing.expect(!keptClashes(&snaps, a.base + a.at, 192512, &a));
+}
+
+test "restore tail preserves earlier marks but protects a longer branch checkpoint" {
+    var selected: Snap = .{ .id = 1, .base = 0, .at = 4096, .buf = undefined };
+    var earlier: Snap = .{ .id = 2, .base = 0, .at = 2048, .buf = undefined };
+    var longer: Snap = .{ .id = 3, .base = 0, .at = 6144, .buf = undefined };
+    try std.testing.expect(!keptClashes(&.{ &selected, &earlier }, 4096, 6144, &selected));
+    try std.testing.expect(keptClashes(&.{ &selected, &earlier, &longer }, 4096, 6144, &selected));
+}
+
+test "relocation placement pins its oldest source while evicting another snapshot" {
+    var m: Model = undefined;
+    m.pool_cap = 12288;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer ln.snaps.deinit(ln.gpa);
+    var source: Snap = .{ .id = 1, .base = 0, .at = 4096, .buf = undefined };
+    var other: Snap = .{ .id = 2, .base = 4096, .at = 4096, .buf = undefined };
+    try ln.snaps.appendSlice(ln.gpa, &.{ &source, &other });
+    try std.testing.expectEqual(@as(usize, 4096), try ln.placeKept(&.{}, 6144, &source));
+    try std.testing.expect(!source.stale);
+    try std.testing.expect(other.stale);
+}
+
+test "live pool refusal does not evict snapshots and source pressure is explicit" {
+    var m: Model = undefined;
+    m.pool_cap = 8192;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer ln.snaps.deinit(ln.gpa);
+    var source: Snap = .{ .id = 1, .base = 0, .at = 6144, .buf = undefined };
+    try ln.snaps.append(ln.gpa, &source);
+    try std.testing.expectError(error.ContextFull, ln.placeKept(&.{.{ 0, 8192 }}, 2048, &source));
+    try std.testing.expect(!source.stale);
+    try std.testing.expectError(error.KeptExtentFull, ln.placeKept(&.{}, 4096, &source));
+    try std.testing.expect(!source.stale);
 }
 
 test "a frame's fields read back as written" {

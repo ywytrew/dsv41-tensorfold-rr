@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! CUDA family registration, device setup, memory admission and the native lane host.
 const std = @import("std");
 const cuda = @import("cuda");
@@ -209,6 +212,15 @@ const Host = struct {
     fn backend(h: *Host) lanes.backend.Backend {
         const v = h.inner.vtable;
         h.vtable = .{
+            // Preserve the family's cooperative prompt contract through the CUDA-context wrapper.
+            .prefill_step = if (v.prefill_step != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!bool {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_step.?(x.inner.ptr, s);
+                }
+            }.f else null,
+            .prefill_decode_rounds = v.prefill_decode_rounds,
+            .prefill_serial = v.prefill_serial,
             .prefill = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream) anyerror!void {
                     const x = bind(p);
@@ -510,4 +522,38 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
         try history.append(gpa, t);
     }
     try std.testing.expectEqual(@as(usize, 40), restored.tokens.items.len);
+}
+
+test "CUDA context wrapper preserves partial prefill, completion, errors and legacy fallback" {
+    const gpa = std.testing.allocator;
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    const Hooks = struct {
+        fn release(_: *anyopaque) void {}
+        fn advance(p: *anyopaque, _: *lanes.Stream) anyerror!bool {
+            const f: *lanes.fake.Fake = @ptrCast(@alignCast(p));
+            f.prefill_count += 1;
+            if (f.prefill_count == 3) return error.InjectedPromptFailure;
+            return f.prefill_count == 2;
+        }
+    };
+    var vt = target.backend().vtable.*;
+    vt.prefill_step = Hooks.advance;
+    vt.prefill_decode_rounds = 8;
+    vt.prefill_serial = true;
+    var host: Host = .{ .gpa = gpa, .gpu = null, .family = &target, .release = Hooks.release, .inner = .{ .ptr = &target, .vtable = &vt }, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
+    const wrapped = host.backend();
+    try std.testing.expect(wrapped.vtable.prefill_step != null);
+    try std.testing.expectEqual(@as(u32, 8), wrapped.vtable.prefill_decode_rounds);
+    try std.testing.expect(wrapped.vtable.prefill_serial);
+    var stream: lanes.Stream = undefined; // the fake callback never dereferences it
+    try std.testing.expect(!try wrapped.vtable.prefill_step.?(wrapped.ptr, &stream));
+    try std.testing.expect(try wrapped.vtable.prefill_step.?(wrapped.ptr, &stream));
+    try std.testing.expectError(error.InjectedPromptFailure, wrapped.vtable.prefill_step.?(wrapped.ptr, &stream));
+    try std.testing.expectEqual(@as(usize, 3), target.prefill_count);
+    host.inner = target.backend();
+    const legacy = host.backend();
+    try std.testing.expect(legacy.vtable.prefill_step == null);
+    try std.testing.expectEqual(@as(u32, 1), legacy.vtable.prefill_decode_rounds);
+    try std.testing.expect(!legacy.vtable.prefill_serial);
 }

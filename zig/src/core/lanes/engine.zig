@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! The lane round loop (Python FamilyRounds and SharedRounds): every decision and cost update in Python's order.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -83,6 +86,27 @@ pub const Engine = struct {
             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
             return err;
         };
+        try e.finishPrefill(s);
+    }
+
+    /// A partial prompt never enters live: no verify/draft can read its unfinished KV.
+    pub fn advancePrefill(e: *Engine, s: *Stream) !bool {
+        const advance = e.backend.vtable.prefill_step orelse {
+            try e.addStream(s);
+            return true;
+        };
+        const ready = advance(e.backend.ptr, s) catch |err| {
+            if (err == error.Cancelled) e.backend.release(s);
+            return err;
+        };
+        if (!ready) return false;
+        _ = e.arena.reset(.retain_capacity);
+        try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        try e.finishPrefill(s);
+        return true;
+    }
+
+    fn finishPrefill(e: *Engine, s: *Stream) !void {
         if (s.isCancelled()) { // cancelled in its last chunk: no first token
             e.backend.release(s);
             return error.Cancelled;

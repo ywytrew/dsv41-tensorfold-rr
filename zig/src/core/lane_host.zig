@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! The lane core served to the HTTP threads: one thread owns ``core`` and steps rounds while any stream lives.
 const std = @import("std");
 const lanes = @import("lanes");
@@ -44,6 +47,7 @@ pub const LaneHost = struct {
     // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
     // other streams ran): admitted again once fewer than this many streams are active
     full_wait: ?usize = null,
+    prefill_cursor: usize = 0, // round-robin over admitted jobs still filling
 
     const Mark = struct { at: i96, tokens: u64 };
     const window_ns: i96 = 2 * std.time.ns_per_s;
@@ -283,12 +287,14 @@ pub const LaneHost = struct {
     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
     fn admitOne(h: *LaneHost) bool {
         h.lock();
-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
+        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or
+            (h.core.backend.vtable.prefill_serial and h.hasPrefills()))
+        {
             h.unlock();
             return false;
         }
         if (h.full_wait) |n| {
-            const active = h.core.activeCount();
+            const active = h.admitted.items.len; // unfinished prefills also reserve pool space
             if (active > 0 and active >= n) {
                 h.unlock();
                 return false;
@@ -338,14 +344,40 @@ pub const LaneHost = struct {
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
         if (h.loneFits(job)) return h.runLone(job, began);
-        h.core.addStream(&job.stream) catch |e| {
+        return h.fillOne(job);
+    }
+
+    /// One bounded backend pass (or the original synchronous pass for other backends).
+    fn fillOne(h: *LaneHost, job: *Job) bool {
+        const ready = h.core.advancePrefill(&job.stream) catch |e| {
             if (e == error.Cancelled) return h.cancel(job);
-            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+            if (e == error.ContextFull and h.admitted.items.len > 1) return h.requeue(job);
             return h.drop(job, h.words(e));
         };
-        h.prefilled(job, began);
+        // A different job may keep/evict a snapshot before this prompt finishes.
+        // Its restore has already happened, so never retain the Store.Entry across a yield.
+        job.reported();
+        if (!ready) return true;
+        h.prefilled(job, job.began);
         if (h.deliver(job)) h.remove(job);
         return true;
+    }
+
+    fn hasPrefills(h: *LaneHost) bool {
+        for (h.admitted.items) |j| if (j.prefilled == null) return true;
+        return false;
+    }
+
+    fn advanceOne(h: *LaneHost) void {
+        const n = h.admitted.items.len;
+        for (0..n) |off| {
+            const i = (h.prefill_cursor + off) % n;
+            const job = h.admitted.items[i];
+            if (job.prefilled != null) continue;
+            h.prefill_cursor = i + 1;
+            _ = h.fillOne(job);
+            return;
+        }
     }
 
     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
@@ -446,7 +478,7 @@ pub const LaneHost = struct {
             h.finish(job, .failed, "out of memory");
             return true;
         };
-        h.full_wait = h.core.activeCount();
+        h.full_wait = h.admitted.items.len;
         h.unlock();
         return false;
     }
@@ -482,6 +514,7 @@ pub const LaneHost = struct {
         while (true) {
             h.takeCancels();
             while (h.admitOne()) {}
+            h.advanceOne();
             h.noteLive();
             h.lock();
             if (h.closing) {
@@ -492,24 +525,29 @@ pub const LaneHost = struct {
                 continue;
             }
             if (h.core.activeCount() == 0) {
-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
+                if (!h.hasPrefills() and h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
                 h.unlock();
                 continue;
             }
             h.unlock();
-            h.core.step() catch |e| {
-                h.failAll(@errorName(e));
-                continue;
-            };
-            var i: usize = 0;
-            while (i < h.admitted.items.len) {
-                const job = h.admitted.items[i];
-                if (h.deliver(job)) {
-                    h.lock();
-                    _ = h.admitted.orderedRemove(i);
-                    h.unlock();
-                } else i += 1;
+            const rounds = if (h.hasPrefills()) @max(1, h.core.backend.vtable.prefill_decode_rounds) else 1;
+            for (0..rounds) |_| {
+                h.takeCancels();
+                if (h.core.activeCount() == 0) break;
+                h.core.step() catch |e| {
+                    h.failAll(@errorName(e));
+                    break;
+                };
+                var i: usize = 0;
+                while (i < h.admitted.items.len) {
+                    const job = h.admitted.items[i];
+                    if (h.deliver(job)) {
+                        h.lock();
+                        _ = h.admitted.orderedRemove(i);
+                        h.unlock();
+                    } else i += 1;
+                }
             }
         }
     }
@@ -640,4 +678,9 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
     try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
 }
 
-test { _ = @import("lane_host_test.zig"); }
+test {
+    _ = @import("lane_host_test.zig");
+}
+test {
+    _ = @import("lane_host_prefill_test.zig");
+}

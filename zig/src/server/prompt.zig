@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! Prompt ids from a request, as ``prepare_prompt`` and ``render_prompt_ids`` make them.
 const std = @import("std");
 const json = @import("json.zig");

@@ -1,9 +1,15 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! Prometheus text for GET /metrics, family for family as the Python server writes it.
 const std = @import("std");
 const builtin = @import("builtin");
 const api = @import("engine_api");
 
 const prefix = "tensorfold:";
+/// vLLM's own Prometheus names, published as a mirror so a dashboard written for vLLM
+/// reads this engine unchanged: the same numbers under vLLM's spelling.
+const vllm_prefix = "vllm:";
 /// Upper edges shared by the request and time-to-first-token histograms; +Inf is added when rendered.
 pub const buckets = [_]f64{ 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0 };
 pub const tpot_buckets = [_]f64{ 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0 };
@@ -36,6 +42,8 @@ pub const Metrics = struct {
     gpa: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
     prompt: u64 = 0,
+    /// Prompt tokens of finished requests that came from a kept prefix (the prompt cache's hits).
+    cached: u64 = 0,
     generation: u64 = 0,
     drafted: u64 = 0,
     accepted: u64 = 0,
@@ -48,10 +56,11 @@ pub const Metrics = struct {
     tpot: TpotHistogram = .{},
     requests: std.ArrayList(struct { key: []const u8, status: u16, count: u64 }) = .empty,
 
-    pub fn note(m: *Metrics, io: std.Io, prompt: usize, generation: usize, drafted: u64, accepted: u64, rounds: u64, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
+    pub fn note(m: *Metrics, io: std.Io, prompt: usize, cached: u32, generation: usize, drafted: u64, accepted: u64, rounds: u64, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
         m.mutex.lockUncancelable(io);
         defer m.mutex.unlock(io);
         m.prompt += prompt;
+        m.cached += cached;
         m.generation += generation;
         m.drafted += drafted;
         m.accepted += accepted;
@@ -113,6 +122,7 @@ pub const Metrics = struct {
         try gauge(w, "requests_waiting", "gauge", "Requests queued or held until a lane is free.", status.waiting);
         try gauge(w, "generation_tokens_running", "gauge", "Generated tokens held by live streams.", status.generation_tokens);
         try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
+        try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests served from a kept prefix; the prompt cache's hits.", snap.cached);
         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
         const live = streams[0..@min(status.streams, streams.len)];
         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
@@ -130,50 +140,71 @@ pub const Metrics = struct {
             try gauge(w, "device_memory_bytes", "gauge", "Device memory the engine holds now: weights, caches and live streams; only where the backend counts it (CUDA).", mem.active);
             try gauge(w, "device_memory_peak_bytes", "gauge", "The most device memory the engine has held since start or the last /health?reset_peak=1.", mem.peak);
         }
-        try gauge(w, "num_requests_running", "gauge", "Requests in prefill or decode. A mirror of tensorfold:requests_running.", status.running);
-        try gauge(w, "num_requests_waiting", "gauge", "Requests queued or held until a lane is free. A mirror of tensorfold:requests_waiting.", status.waiting);
-        try family(w, "kv_cache_usage_perc", "gauge", "A stream's cache occupancy under vLLM's name; same streams and ratios as tensorfold:kv_cache_usage_ratio.");
-        try pools(w, "kv_cache_usage_perc", "stream", live, window);
-        try gauge(w, "spec_decode_num_draft_tokens_total", "counter", "Draft tokens verified on finished requests, this server's single draft counter.", snap.drafted);
-        try gauge(w, "spec_decode_num_accepted_tokens_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
-        try histogram(w, "e2e_request_latency_seconds", "Seconds from arrival to the reply leaving, under vLLM's name.", snap.latency);
-        try histogram(w, "request_decode_time_seconds", "Seconds a finished request spent decoding, under vLLM's name.", snap.decode);
-        try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
+        try gaugeAt(w, vllm_prefix, "num_requests_running", "gauge", "Requests in prefill or decode. A mirror of tensorfold:requests_running.", status.running);
+        try gaugeAt(w, vllm_prefix, "num_requests_waiting", "gauge", "Requests queued or held until a lane is free. A mirror of tensorfold:requests_waiting.", status.waiting);
+        try familyAt(w, vllm_prefix, "kv_cache_usage_perc", "gauge", "A stream's cache occupancy under vLLM's name; same streams and ratios as tensorfold:kv_cache_usage_ratio.");
+        try poolsAt(w, vllm_prefix, "kv_cache_usage_perc", "stream", live, window);
+        try gaugeAt(w, vllm_prefix, "spec_decode_num_draft_tokens_total", "counter", "Draft tokens verified on finished requests, this server's single draft counter.", snap.drafted);
+        try gaugeAt(w, vllm_prefix, "spec_decode_num_accepted_tokens_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
+        try gaugeAt(w, vllm_prefix, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
+        try gaugeAt(w, vllm_prefix, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests served from a kept prefix.", snap.cached);
+        try gaugeAt(w, vllm_prefix, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
+        try histogramAt(w, vllm_prefix, "e2e_request_latency_seconds", "Seconds from arrival to the reply leaving, under vLLM's name.", snap.latency);
+        try histogramAt(w, vllm_prefix, "request_decode_time_seconds", "Seconds a finished request spent decoding, under vLLM's name.", snap.decode);
+        try histogramAt(w, vllm_prefix, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
+        try histogramAt(w, vllm_prefix, "time_to_first_token_seconds", "Seconds from arrival to the first generated token, under vLLM's name.", snap.ttft);
+        try histogramAt(w, vllm_prefix, "request_time_per_output_token_seconds", "Seconds per output token, under vLLM's name.", snap.tpot);
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
     }
 };
 
+fn familyAt(w: *std.Io.Writer, pre: []const u8, name: []const u8, kind: []const u8, help: []const u8) !void {
+    try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ pre, name, help, pre, name, kind });
+}
+
 fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8) !void {
-    try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });
+    return familyAt(w, prefix, name, kind, help);
+}
+
+fn gaugeAt(w: *std.Io.Writer, pre: []const u8, name: []const u8, kind: []const u8, help: []const u8, value: u64) !void {
+    try familyAt(w, pre, name, kind, help);
+    try w.print("{s}{s} {d}\n", .{ pre, name, value });
 }
 
 fn gauge(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8, value: u64) !void {
-    try family(w, name, kind, help);
-    try w.print("{s}{s} {d}\n", .{ prefix, name, value });
+    return gaugeAt(w, prefix, name, kind, help, value);
 }
 
-fn pools(w: *std.Io.Writer, name: []const u8, label: []const u8, lengths: []const u32, window: u32) !void {
-    if (lengths.len == 0) return w.print("{s}{s}{{{s}=\"0\"}} 0\n", .{ prefix, name, label });
+fn poolsAt(w: *std.Io.Writer, pre: []const u8, name: []const u8, label: []const u8, lengths: []const u32, window: u32) !void {
+    if (lengths.len == 0) return w.print("{s}{s}{{{s}=\"0\"}} 0\n", .{ pre, name, label });
     for (lengths, 0..) |n, i| {
         const ratio: f64 = if (window == 0) 0 else @min(1.0, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(window)));
         var buf: [40]u8 = undefined;
-        try w.print("{s}{s}{{{s}=\"{d}\"}} {s}\n", .{ prefix, name, label, i, num(&buf, ratio) });
+        try w.print("{s}{s}{{{s}=\"{d}\"}} {s}\n", .{ pre, name, label, i, num(&buf, ratio) });
     }
 }
 
-fn histogram(w: *std.Io.Writer, name: []const u8, help: []const u8, h: anytype) !void {
-    try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} histogram\n", .{ prefix, name, help, prefix, name });
+fn pools(w: *std.Io.Writer, name: []const u8, label: []const u8, lengths: []const u32, window: u32) !void {
+    return poolsAt(w, prefix, name, label, lengths, window);
+}
+
+fn histogramAt(w: *std.Io.Writer, pre: []const u8, name: []const u8, help: []const u8, h: anytype) !void {
+    try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} histogram\n", .{ pre, name, help, pre, name });
     var cumulative: u64 = 0;
     const edges = @TypeOf(h).bucket_edges;
     for (edges, 0..) |edge, i| {
         cumulative += h.counts[i];
         var buf: [40]u8 = undefined;
-        try w.print("{s}{s}_bucket{{le=\"{s}\"}} {d}\n", .{ prefix, name, trimmed(&buf, edge, 4), cumulative });
+        try w.print("{s}{s}_bucket{{le=\"{s}\"}} {d}\n", .{ pre, name, trimmed(&buf, edge, 4), cumulative });
     }
-    try w.print("{s}{s}_bucket{{le=\"+Inf\"}} {d}\n", .{ prefix, name, cumulative + h.counts[edges.len] });
+    try w.print("{s}{s}_bucket{{le=\"+Inf\"}} {d}\n", .{ pre, name, cumulative + h.counts[edges.len] });
     var buf: [40]u8 = undefined;
-    try w.print("{s}{s}_sum {s}\n{s}{s}_count {d}\n", .{ prefix, name, num(&buf, h.total), prefix, name, h.n });
+    try w.print("{s}{s}_sum {s}\n{s}{s}_count {d}\n", .{ pre, name, num(&buf, h.total), pre, name, h.n });
+}
+
+fn histogram(w: *std.Io.Writer, name: []const u8, help: []const u8, h: anytype) !void {
+    return histogramAt(w, prefix, name, help, h);
 }
 
 /// ``_num``: an integral value as an int, else six decimals without trailing zeros.

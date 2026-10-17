@@ -15,3 +15,7 @@ venv/
 .zig-toolchain
 .zig-cache/
 zig-out/
+
+# Local RR outputs; not source distribution
+/build-out*/
+*.local.env

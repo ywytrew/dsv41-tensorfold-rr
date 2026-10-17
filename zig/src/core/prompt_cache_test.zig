@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! The prompt cache's tests: a fake family whose state is a running sum, so a resumed pass equals a fresh one exactly when it should.
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
@@ -134,6 +137,10 @@ const Fake = struct {
 
     /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
     fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
+        return f.passImages(s, prompt, plan, &.{});
+    }
+
+    fn passImages(f: *Fake, s: *Store, prompt: []const u32, plan: Plan, images: []const @import("lanes").stream.Image) u64 {
         if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
         if (f.peer) |p| p.in_pass = true;
         defer if (f.peer) |p| {
@@ -144,7 +151,7 @@ const Fake = struct {
             f.sum = f.sum *% 31 +% t;
             f.at += 1;
             if (mi < plan.marks.len and plan.marks[mi] == f.at) {
-                _ = s.keep(prompt, f.at, null, &.{}, &.{});
+                _ = s.keep(prompt, f.at, null, &.{}, images);
                 mi += 1;
             }
         }
@@ -213,7 +220,7 @@ test "an entry keys the images its tokens cover: only the same image resumes it"
     const red = [_]Image{.{ .at = 1, .tokens = 3, .bytes = &.{}, .key = 0x1111 }};
     const blue = [_]Image{.{ .at = 1, .tokens = 3, .bytes = &.{}, .key = 0x2222 }};
     const past = [_]Image{.{ .at = 4, .tokens = 2, .bytes = &.{}, .key = 0x1111 }};
-    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &red)); // keeps [1 2 3 4] + 5, covering the image
+    _ = f.passImages(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &red), &red); // keeps [1 2 3 4] + 5, covering the image
     try std.testing.expectEqual(@as(u32, 4), s.find(&t1, &.{}, &red).?.at);
     try std.testing.expect(s.find(&t1, &.{}, &blue) == null); // another image's state: never this one's
     try std.testing.expect(s.find(&t1, &.{}, &.{}) == null); // a request without it is not this state's either
@@ -490,7 +497,7 @@ test "past the learned-state cap the least recently used state is forgotten, and
     defer t.deinit();
     t.imprint = &im;
     const p3 = two ++ [_]u32{ 2, 9 };
-    const plan = try t.begin(a, &p3, 7, &.{5}, &.{}, null);
+    const plan = try t.begin(a, &p3, 7, &.{5}, &.{}, null, &.{});
     try std.testing.expectEqual(@as(u32, 0), plan.from); // the read failed: a fresh pass, and the state is forgotten
     try std.testing.expect(!im.has(imprint.Imprint.keyOf(&two)));
     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));

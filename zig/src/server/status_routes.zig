@@ -1,3 +1,6 @@
+// Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+// Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+// Modified in dsv41-tensorfold-rr, 2026-10-17.
 //! GET /health, /v1/models, /metrics, and the opt-in dashboard.
 const std = @import("std");
 const api = @import("engine_api");
@@ -42,6 +45,9 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
         try m.put(a, "object", .{ .string = "model" });
         try m.put(a, "created", try json.intValue(a, created));
         try m.put(a, "owned_by", .{ .string = "tensorfold" });
+        // OpenAI clients and the house monitor read the context window from here;
+        // vLLM reports it as max_model_len, so this engine does too.
+        if (srv.info.context_window > 0) try m.put(a, "max_model_len", try json.intValue(a, srv.info.context_window));
         slot.* = .{ .object = m };
     }
     const o = try json.newObject(a);
