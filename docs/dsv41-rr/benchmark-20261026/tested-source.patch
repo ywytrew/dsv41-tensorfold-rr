@@ -1,0 +1,1741 @@
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -1,3 +1,4 @@
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! The engine a server drives (``Engine``), and ``LaneHost``: the lane core served on one thread, rounds left to it.
+ const std = @import("std");
+ const lanes = @import("lanes");
+@@ -179,6 +180,20 @@
+     read: *const fn (ctx: ?*anyopaque, reset_peak: bool) ?Memory,
+ };
+ 
++/// Copied by the engine thread; HTTP readers never touch mutable cache entries.
++pub const CacheStatus = struct {
++    states: usize = 0,
++    held_bytes: u64 = 0,
++    budget_bytes: u64 = 0,
++    hits: u64 = 0,
++    misses: u64 = 0,
++    evicted: u64 = 0,
++    invalidated: u64 = 0,
++    superseded: u64 = 0,
++    watermark_evicted: u64 = 0,
++    failed: u64 = 0,
++};
++
+ pub const Status = struct {
+     /// Requests in prefill or decode, and those waiting for a lane.
+     running: u32 = 0,
+@@ -192,6 +207,7 @@
+     streams: usize = 0,
+     /// Generated tokens held by live streams, excluding their prompts.
+     generation_tokens: u64 = 0,
++    prompt_cache: ?CacheStatus = null,
+ };
+ 
+ pub const SubmitError = error{ Closed, Busy };
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! The lane core served to the HTTP threads: one thread owns ``core`` and steps rounds while any stream lives.
+ const std = @import("std");
+ const lanes = @import("lanes");
+@@ -47,6 +48,7 @@
+     // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
+     // other streams ran): admitted again once fewer than this many streams are active
+     full_wait: ?usize = null,
++    cache_status: ?api.CacheStatus = null,
+     prefill_cursor: usize = 0, // round-robin over admitted jobs still filling
+ 
+     const Mark = struct { at: i96, tokens: u64 };
+@@ -66,6 +68,9 @@
+         prefilled: ?i96 = null,
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
++        received: i96 = 0,
++        requeues: u32 = 0,
++        id_text: [32]u8 = undefined,
+         kept0: u64 = 0, // the store's kept count when the job looked it up
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+@@ -131,7 +136,7 @@
+     fn submitFn(ctx: *anyopaque, id: Id, request: *const Request, sink: Sink) SubmitError!void {
+         const h = self(ctx);
+         const job = h.gpa.create(Job) catch return error.Busy;
+-        job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
++        job.* = .{ .host = h, .id = id, .request = request, .sink = sink, .received = std.Io.Clock.awake.now(h.io).toNanoseconds() };
+         h.mutex.lockUncancelable(h.io);
+         defer h.mutex.unlock(h.io);
+         if (h.closing) {
+@@ -177,6 +182,7 @@
+             .preemptions = 0,
+             .streams = n,
+             .generation_tokens = h.live_generated,
++            .prompt_cache = h.cache_status,
+         };
+     }
+ 
+@@ -320,7 +326,7 @@
+         } else |_| {};
+         job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
+         job.stream = lanes.Stream.init(h.gpa, .{
+-            .id = "request",
++            .id = std.fmt.bufPrint(&job.id_text, "job-{d}", .{job.id}) catch unreachable,
+             .prompt = r.prompt,
+             .max_new = r.max_tokens,
+             .eos = r.eos,
+@@ -388,7 +394,12 @@
+         job.prefilled = done;
+         h.unlock();
+         job.reported();
++        // Restore ownership has ended. Maintenance must not run inside Job.kept:
++        // the backend still holds its source Snap pointer while prefilling.
++        if (h.cache) |store| store.maintain(job.request.prompt, job.request.images);
+         if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0, job.request.images.len);
++        if (!@import("builtin").is_test)
++            std.log.info("prompt cache request: job={d} prompt={d} cached={d} recomputed={d} max_new={d} requeues={d} queue_ms={d} prefill_ms={d}", .{ job.id, job.request.prompt.len, job.stream.cached, job.request.prompt.len - job.stream.cached, job.request.max_tokens, job.requeues, @divTrunc(job.began - job.received, std.time.ns_per_ms), @divTrunc(done - job.began, std.time.ns_per_ms) });
+         emit(job, .{ .prefilled = job.stream.cached });
+     }
+ 
+@@ -460,6 +471,9 @@
+     /// anything of it was placed) goes back to the queue's front and waits until one of them ends, as the Python
+     /// lane's window waits, instead of failing. Returns false: nothing more is admitted now.
+     fn requeue(h: *LaneHost, job: *Job) bool {
++        job.requeues += 1;
++        if (!@import("builtin").is_test)
++            std.log.info("prompt cache wait: job={d} prompt={d} max_new={d} attempt={d} active={d}", .{ job.id, job.request.prompt.len, job.request.max_tokens, job.requeues, h.admitted.items.len - 1 });
+         h.remove(job);
+         h.core.discard(&job.stream);
+         job.entry = null; // nothing was restored: the store keeps the entry for the next lookup
+@@ -504,6 +518,10 @@
+         defer h.unlock();
+         h.live_tokens.clearRetainingCapacity();
+         h.live_generated = 0;
++        if (h.cache) |store| {
++            const c = store.counts;
++            h.cache_status = .{ .states = store.entries.items.len, .held_bytes = store.held, .budget_bytes = store.budget, .hits = c.hits, .misses = c.misses, .evicted = c.evicted, .invalidated = c.invalidated, .superseded = c.superseded, .watermark_evicted = c.gc_evicted, .failed = c.failed };
++        }
+         for (h.admitted.items) |job| if (job.started) {
+             h.live_tokens.append(h.gpa, @intCast(job.stream.context.items.len)) catch {};
+             h.live_generated += @intCast(job.stream.emitted().len);
+--- a/zig/src/core/lane_host_prefill_test.zig
++++ b/zig/src/core/lane_host_prefill_test.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! Scheduler contract tests: partial prompts cannot decode; other jobs can make progress.
+ const std = @import("std");
+ const lanes = @import("lanes");
+@@ -115,6 +116,10 @@
+ };
+ 
+ fn runCase(mode: @FieldType(Target, "mode"), serial: bool) !void {
++    return runCaseWithGC(mode, serial, false);
++}
++
++fn runCaseWithGC(mode: @FieldType(Target, "mode"), serial: bool, gc: bool) !void {
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+     defer cfg.deinit(gpa);
+     var target: Target = .{ .mode = mode, .serial = serial };
+@@ -139,7 +144,7 @@
+         }
+     };
+     // One snapshot only: another admission must evict A's restored entry while A is still filling.
+-    var store = pc.Store.init(gpa, .{ .ptr = &target.fake, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 100);
++    var store = pc.Store.init(gpa, .{ .ptr = &target.fake, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0, .gc = gc }, if (gc) 280 else 100);
+     defer store.deinit();
+     const prompts = [_][8]u32{ .{ 1, 9, 5, 2, 4, 8, 3, 6 }, .{ 2, 1, 7, 2, 3, 4, 5, 8 }, .{ 3, 4, 4, 1, 8, 5, 9, 7 } };
+     if (mode == .cache) {
+@@ -200,6 +205,11 @@
+     if (mode == .cache) {
+         try std.testing.expectEqual(@as(u64, 1), store.counts.hits);
+         try std.testing.expect(store.counts.evicted >= 1);
++        if (gc) {
++            try std.testing.expect(store.counts.gc_runs > 0);
++            try std.testing.expect(store.counts.gc_evicted > 0);
++            try std.testing.expectEqual(@as(u64, 0), store.counts.failed);
++        }
+     }
+     if (mode == .normal and serial) {
+         try std.testing.expect(target.decoded_during_fill);
+@@ -231,6 +241,10 @@
+     try runCase(.cache, false);
+ }
+ 
++test "watermark GC during round-robin prefill preserves active jobs and exact decoded output" {
++    try runCaseWithGC(.cache, false, true);
++}
++
+ test "single pending prefill policy normal allows decode and eventual queue progress" {
+     try runCase(.normal, true);
+ }
+--- a/zig/src/core/lane_host_reuse_test.zig
++++ b/zig/src/core/lane_host_reuse_test.zig
+@@ -1,3 +1,4 @@
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! LaneHost with the prompt cache: a conversation's next turn resumes from its kept prompt state (the fake backend).
+ const std = @import("std");
+ const lanes = @import("lanes");
+@@ -10,6 +11,14 @@
+ const Reason = api.Reason;
+ 
+ test "a lane host resumes a conversation from its kept prompt state and reports the cached tokens" {
++    try exerciseLaneHost(false);
++}
++
++test "GC in the host drops a restored checkpoint safely and the next turn still hits with exact tokens" {
++    try exerciseLaneHost(true);
++}
++
++fn exerciseLaneHost(gc: bool) !void {
+     const gpa = std.testing.allocator;
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+     defer cfg.deinit(gpa);
+@@ -34,7 +43,9 @@
+             f.drop(saved);
+         }
+     };
+-    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++    // GC case: 96 + 128 = 224 bytes crosses 90% of 248. Keep the new 128-byte
++    // checkpoint, drop the 96-byte state just restored, and land below 70%.
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0, .gc = gc }, if (gc) 248 else 1 << 20);
+     defer store.deinit();
+     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+     host.cache = &store;
+@@ -93,7 +104,19 @@
+         try history.append(gpa, t);
+     }
+     try std.testing.expectEqual(@as(u64, 1), store.counts.hits);
+-    try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
++    try std.testing.expectEqual(@as(usize, if (gc) 1 else 2), store.entries.items.len);
++    if (gc) {
++        try std.testing.expectEqual(@as(u64, 1), store.counts.gc_runs);
++        try std.testing.expectEqual(@as(u64, 1), store.counts.gc_evicted);
++        try std.testing.expectEqual(@as(u64, 128), store.held);
++        var b3: Box = .{};
++        defer b3.tokens.deinit(gpa);
++        try e.submit(3, &r2, .{ .ctx = &b3, .event = Box.event });
++        try std.testing.expectEqual(Reason.length, b3.wait());
++        try std.testing.expectEqual(@as(?u32, 16), b3.cached);
++        try std.testing.expectEqualSlices(u32, b2.tokens.items, b3.tokens.items);
++        try std.testing.expectEqual(@as(u64, 0), store.counts.failed);
++    }
+ }
+ 
+ test "a turn's mark evicting the state it resumed from: the hit is reported first and the entry freed once" {
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! Exact prompt reuse for any family and backend: states kept at prompt-pass chunk ends, found by their tokens and
+ //! the images their tokens cover (an image's are placeholders: a state is resumed only among images equal to its own).
+ const std = @import("std");
+@@ -24,6 +25,13 @@
+         /// Make the live state `saved`'s: the next prompt chunk starts at its position.
+         restore: *const fn (ptr: *anyopaque, owner: ?*anyopaque, saved: Saved) anyerror!void,
+         drop: *const fn (ptr: *anyopaque, saved: Saved) void,
++        /// A backend may reclaim a retained extent without freeing its snapshot object.
++        /// False means permanently invalid; queried only by the engine thread.
++        valid: ?*const fn (ptr: *anyopaque, saved: Saved) bool = null,
++        /// A valid state can still be unsuitable for this request (for example its replay window).
++        usable: ?*const fn (ptr: *anyopaque, saved: Saved, prompt_len: usize) bool = null,
++        /// Keep backend placement's LRU in step with successful cache use.
++        touch: ?*const fn (ptr: *anyopaque, saved: Saved) void = null,
+         /// The storage a kept state holds: new storage up to `bytes`, or the spare storage it took (null: `bytes`).
+         charged: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
+         /// Free storage the family keeps for later saves, inside the budget (null: none).
+@@ -51,6 +59,8 @@
+     min_gap: u32 = 256,
+     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
+     min_prompt: u32 = 4096,
++    /// Opt-in for the DSV4.1 extent-backed cache; other families keep their existing policy.
++    gc: bool = false,
+ };
+ 
+ pub const Entry = struct {
+@@ -65,7 +75,10 @@
+     mm: u64 = 0, // the images `tokens` cover (imageKey): a state resumes only among the same ones
+ };
+ 
+-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
++pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, invalidated: u64 = 0, superseded: u64 = 0, gc_runs: u64 = 0, gc_evicted: u64 = 0 };
++
++pub const GC_HIGH_PERCENT: u64 = 90;
++pub const GC_LOW_PERCENT: u64 = 70;
+ 
+ /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
+ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+@@ -151,6 +164,8 @@
+     pub fn find(s: *Store, prompt: []const u32, starts: []const u32, images: []const Image) ?*Entry {
+         var best: ?*Entry = null;
+         for (s.entries.items) |e| {
++            if (s.family.vtable.valid) |f| if (!f(s.family.ptr, e.saved)) continue;
++            if (s.family.vtable.usable) |f| if (!f(s.family.ptr, e.saved, prompt.len)) continue;
+             if (e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
+             const n = e.tokens.len;
+             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
+@@ -177,6 +192,9 @@
+ 
+     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
+     pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, images: []const Image) !Lookup {
++        // No request owns a looked-up pointer yet. Remove dead states before choosing
++        // the longest match so a shorter valid prefix remains a real cache hit.
++        if (s.rules.gc) _ = s.purgeInvalid();
+         const e = s.recall(prompt, starts, s.find(prompt, starts, images));
+         if (e == null) s.counts.misses += 1;
+         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
+@@ -241,6 +259,7 @@
+         }
+         s.clock += 1;
+         e.used = s.clock;
++        if (s.family.vtable.touch) |f| f(s.family.ptr, e.saved);
+         s.counts.hits += 1;
+         const last = s.gpa.dupe(u32, prompt) catch return;
+         s.gpa.free(e.last);
+@@ -283,7 +302,11 @@
+         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
+         const mm = imageKey(images, n);
+         for (s.entries.items) |e| if (e.at == at and e.mm == mm and std.mem.eql(u32, e.tokens, prompt[0..n])) {
++            // Placement may have invalidated this entry since lookup. Do not mistake
++            // its old token key for a newly saved, usable checkpoint.
++            if (s.family.vtable.valid) |f| if (!f(s.family.ptr, e.saved)) continue;
+             e.used = s.clock; // the same state again: no copy (a state of other images is another state)
++            if (s.family.vtable.touch) |f| f(s.family.ptr, e.saved);
+             e.shared = e.shared or shared;
+             return true;
+         };
+@@ -332,6 +355,124 @@
+         if (shared) s.learn(e, starts);
+         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
+         return true;
++    }
++
++    fn percent(n: u64, p: u64) u64 {
++        return (n / 100) * p + ((n % 100) * p) / 100;
++    }
++
++    fn prefix(a: []const u32, b: []const u32) bool {
++        return a.len <= b.len and std.mem.eql(u32, a, b[0..a.len]);
++    }
++
++    fn related(a: *const Entry, b: *const Entry) bool {
++        return a.mm == b.mm and (prefix(a.tokens, b.tokens) or prefix(b.tokens, a.tokens));
++    }
++
++    /// At admission before lookup, or after Job.reported released its restore pointer.
++    /// Invalid snapshots are freed through the family's normal (TP-mirrored) drop path.
++    pub fn purgeInvalid(s: *Store) usize {
++        const valid = s.family.vtable.valid orelse return 0;
++        var removed: usize = 0;
++        var i: usize = 0;
++        while (i < s.entries.items.len) {
++            if (valid(s.family.ptr, s.entries.items[i].saved)) {
++                i += 1;
++            } else {
++                s.remove(i);
++                s.counts.invalidated += 1;
++                s.counts.evicted += 1;
++                removed += 1;
++            }
++        }
++        if (removed > 0 and !@import("builtin").is_test)
++            std.log.info("prompt cache gc: reason=invalid removed={d} held_bytes={d} invalidated_total={d}", .{ removed, s.held, s.counts.invalidated });
++        return removed;
++    }
++
++    /// Bound a text conversation's chain to its two longest useful checkpoints.
++    /// Shared cuts and branch points stay: a longer A does not replace a fork B.
++    /// Images are conservatively left to LRU because a full-image hash is not a prefix hash.
++    fn pruneHistory(s: *Store, prompt: []const u32, images: []const Image) usize {
++        if (images.len != 0) return 0;
++        var latest: ?*Entry = null;
++        var previous: ?*Entry = null;
++        for (s.entries.items) |e| {
++            if (e.shared or e.mm != 0 or !prefix(e.tokens, prompt)) continue;
++            if (latest == null or e.at > latest.?.at) {
++                previous = latest;
++                latest = e;
++            } else if (previous == null or e.at > previous.?.at) previous = e;
++        }
++        if (previous == null) return 0;
++        var removed: usize = 0;
++        var i: usize = 0;
++        while (i < s.entries.items.len) {
++            const e = s.entries.items[i];
++            if (e == latest or e == previous or e.shared or e.mm != 0 or !prefix(e.tokens, prompt)) {
++                i += 1;
++                continue;
++            }
++            const fork = for (s.entries.items) |other| {
++                if (other == e or !prefix(e.tokens, other.tokens)) continue;
++                if (other.mm != 0 or (!prefix(other.tokens, prompt) and !prefix(prompt, other.tokens))) break true;
++            } else false;
++            if (fork) {
++                i += 1;
++                continue;
++            }
++            s.remove(i);
++            s.counts.superseded += 1;
++            s.counts.evicted += 1;
++            removed += 1;
++        }
++        return removed;
++    }
++
++    /// Engine-thread safe point, AFTER restore reporting, never from an HTTP/timer thread
++    /// or during a backend's keep callback. Live lanes own their data independently of
++    /// these idle snapshot copies; dropping one only releases its retained reservation.
++    pub fn maintain(s: *Store, prompt: []const u32, images: []const Image) void {
++        if (!s.rules.gc) return;
++        const before = s.held + s.spare();
++        const high = percent(s.budget, GC_HIGH_PERCENT);
++        const low = percent(s.budget, GC_LOW_PERCENT);
++        const trigger = before > 0 and before >= high;
++        _ = s.purgeInvalid();
++        const superseded = s.pruneHistory(prompt, images);
++        if (superseded > 0 and !@import("builtin").is_test)
++            std.log.info("prompt cache gc: reason=superseded removed={d} held_bytes={d} superseded_total={d}", .{ superseded, s.held, s.counts.superseded });
++        if (!trigger) return;
++
++        // Protect the newest checkpoint of the two most recently used distinct
++        // branches. These are soft retention priorities, not a live-job reference.
++        var first: ?*Entry = null;
++        for (s.entries.items) |e| if (!e.shared and (first == null or e.used > first.?.used)) {
++            first = e;
++        };
++        var second: ?*Entry = null;
++        for (s.entries.items) |e| {
++            if (e.shared or (first != null and related(e, first.?))) continue;
++            if (second == null or e.used > second.?.used) second = e;
++        }
++        if (s.family.vtable.trim) |f| f(s.family.ptr, low -| s.held);
++        var removed: usize = 0;
++        while (s.held + s.spare() > low) {
++            var victim: ?usize = null;
++            for (s.entries.items, 0..) |e, i| {
++                if (e == first or e == second) continue;
++                if (victim == null or e.used < s.entries.items[victim.?].used) victim = i;
++            }
++            const i = victim orelse break; // never clear the hot branches just to meet a percentage
++            s.remove(i);
++            s.counts.evicted += 1;
++            s.counts.gc_evicted += 1;
++            removed += 1;
++            if (s.family.vtable.trim) |f| f(s.family.ptr, low -| s.held);
++        }
++        s.counts.gc_runs += 1;
++        if (!@import("builtin").is_test)
++            std.log.info("prompt cache gc: reason=watermark high={d} low={d} before_bytes={d} after_bytes={d} budget_bytes={d} removed={d} target_met={} runs={d}", .{ GC_HIGH_PERCENT, GC_LOW_PERCENT, before, s.held + s.spare(), s.budget, removed, s.held + s.spare() <= low, s.counts.gc_runs });
+     }
+ 
+     /// A shared cut's state written to disk once (--learn): later sessions read it back, after a restart too.
+--- a/zig/src/core/prompt_cache_test.zig
++++ b/zig/src/core/prompt_cache_test.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! The prompt cache's tests: a fake family whose state is a running sum, so a resumed pass equals a fresh one exactly when it should.
+ const std = @import("std");
+ const pc = @import("prompt_cache.zig");
+@@ -35,8 +36,25 @@
+     live: usize = 0,
+     spare_bytes: u64 = 0,
+     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
+-
+-    const State = struct { at: u32, sum: u64 };
++    replay_window: usize = 0,
++    touched: usize = 0,
++
++    const State = struct { at: u32, sum: u64, valid: bool = true };
++
++    fn gcSnapshots(f: *Fake) Snapshots {
++        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .valid = validFn, .usable = usableFn, .touch = touchFn } };
++    }
++    fn validFn(_: *anyopaque, saved: Saved) bool {
++        const st: *State = @ptrCast(@alignCast(saved));
++        return st.valid;
++    }
++    fn usableFn(ptr: *anyopaque, saved: Saved, len: usize) bool {
++        const st: *State = @ptrCast(@alignCast(saved));
++        return st.at <= len -| of(ptr).replay_window;
++    }
++    fn touchFn(ptr: *anyopaque, _: Saved) void {
++        of(ptr).touched += 1;
++    }
+ 
+     fn snapshots(f: *Fake) Snapshots {
+         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn } };
+@@ -141,7 +159,10 @@
+     }
+ 
+     fn passImages(f: *Fake, s: *Store, prompt: []const u32, plan: Plan, images: []const @import("lanes").stream.Image) u64 {
+-        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
++        if (plan.from == 0) {
++            f.at = 0;
++            f.sum = 0;
++        }
+         if (f.peer) |p| p.in_pass = true;
+         defer if (f.peer) |p| {
+             p.in_pass = false;
+@@ -503,3 +524,143 @@
+     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
+     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
+ }
++
++fn keepGc(f: *Fake, s: *Store, tokens: []const u32, at: u32) !void {
++    f.at = at;
++    f.sum = fresh(tokens[0..at]);
++    try std.testing.expect(s.keep(tokens, at, null, &.{}, &.{}));
++}
++
++test "GC waits above 85 percent, starts exactly at 90, stops at 70, preserves two branches" {
++    const gpa = std.testing.allocator;
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.gcSnapshots(), .{ .gc = true, .min_prompt = 0 }, 1100);
++    defer s.deinit();
++    for (1..10) |id| {
++        const p = [_]u32{ @intCast(id), 2, 3, 4, 5, 9 };
++        try keepGc(&f, &s, &p, 5); // 9 x 105 = 945: 85.9%, must not trigger the old 85% rule
++    }
++    s.maintain(&.{ 9, 2, 3, 4, 5, 9 }, &.{});
++    try std.testing.expectEqual(@as(u64, 0), s.counts.gc_runs);
++    try std.testing.expectEqual(@as(u64, 945), s.held);
++    // Revisit branch 1; oldest-created does not mean least-recently-used.
++    const a = s.find(&.{ 1, 2, 3, 4, 5, 9 }, &.{}, &.{}).?;
++    s.resumed(a, &.{ 1, 2, 3, 4, 5, 9 }, true);
++    s.budget = 1050; // same contents exactly at 90%; the 70% target is 735 bytes
++    s.maintain(&.{ 9, 2, 3, 4, 5, 9 }, &.{});
++    try std.testing.expectEqual(@as(u64, 1), s.counts.gc_runs);
++    try std.testing.expectEqual(@as(u64, 2), s.counts.gc_evicted);
++    try std.testing.expectEqual(@as(u64, 735), s.held);
++    try std.testing.expect(s.find(&.{ 1, 2, 3, 4, 5, 9 }, &.{}, &.{}) != null);
++    try std.testing.expect(s.find(&.{ 9, 2, 3, 4, 5, 9 }, &.{}, &.{}) != null);
++    try std.testing.expect(s.find(&.{ 2, 2, 3, 4, 5, 9 }, &.{}, &.{}) == null);
++    s.maintain(&.{ 9, 2, 3, 4, 5, 9 }, &.{});
++    try std.testing.expectEqual(@as(u64, 1), s.counts.gc_runs);
++    try std.testing.expectEqual(@as(usize, 1), f.touched);
++    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
++}
++
++test "GC invalid longest prefix falls back to shorter and preserves exact output" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.gcSnapshots(), .{ .gc = true, .min_prompt = 0 }, 10000);
++    defer s.deinit();
++    const p = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++    try keepGc(&f, &s, &p, 4);
++    try keepGc(&f, &s, &p, 8);
++    const st: *Fake.State = @ptrCast(@alignCast(s.entries.items[1].saved));
++    st.valid = false;
++    try std.testing.expectEqual(@as(u32, 4), s.find(&p, &.{}, &.{}).?.at);
++    const plan = try s.begin(arena.allocator(), &p, 9, &.{}, &.{}, null, &.{});
++    try std.testing.expectEqual(@as(u32, 4), plan.from);
++    try std.testing.expectEqual(fresh(&p), f.pass(&s, &p, plan));
++    try std.testing.expectEqual(@as(u64, 1), s.counts.invalidated);
++    try std.testing.expectEqual(@as(u64, 1), s.counts.hits);
++    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
++}
++
++test "GC request-specific unusability skips but does not delete a valid longer snapshot" {
++    const gpa = std.testing.allocator;
++    var f: Fake = .{ .gpa = gpa, .replay_window = 3 };
++    var s = Store.init(gpa, f.gcSnapshots(), .{ .gc = true, .min_prompt = 0 }, 10000);
++    defer s.deinit();
++    const p = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++    try keepGc(&f, &s, &p, 4);
++    try keepGc(&f, &s, &p, 8);
++    try std.testing.expectEqual(@as(u32, 4), s.find(p[0..10], &.{}, &.{}).?.at);
++    try std.testing.expectEqual(@as(usize, 0), s.purgeInvalid());
++    try std.testing.expectEqual(@as(u32, 8), s.find(&p, &.{}, &.{}).?.at);
++}
++
++test "GC stale token-key duplicate is replaced by a real new save" {
++    const gpa = std.testing.allocator;
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.gcSnapshots(), .{ .gc = true, .min_prompt = 0 }, 10000);
++    defer s.deinit();
++    const p = [_]u32{ 1, 2, 3, 4, 5, 9 };
++    try keepGc(&f, &s, &p, 4);
++    const stale: *Fake.State = @ptrCast(@alignCast(s.entries.items[0].saved));
++    stale.valid = false; // backend placement invalidated it after lookup
++    try keepGc(&f, &s, &p, 4);
++    try std.testing.expectEqual(@as(u64, 2), s.counts.kept);
++    s.maintain(&p, &.{});
++    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
++    try std.testing.expectEqual(@as(u32, 4), s.find(&p, &.{}, &.{}).?.at);
++}
++
++test "GC pruning preserves forks shared cuts and an unrelated B conversation" {
++    const gpa = std.testing.allocator;
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.gcSnapshots(), .{ .gc = true, .min_prompt = 0 }, 10000);
++    defer s.deinit();
++    const a = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++    for ([_]u32{ 2, 4, 6, 8, 10 }) |at| try keepGc(&f, &s, &a, at);
++    try keepGc(&f, &s, &a, 3);
++    s.entries.items[s.entries.items.len - 1].shared = true;
++    const fork = [_]u32{ 1, 2, 3, 4, 99, 98, 97, 96 };
++    const b = [_]u32{ 90, 91, 92, 93, 94, 95 };
++    try keepGc(&f, &s, &fork, 7);
++    try keepGc(&f, &s, &b, 5);
++    s.maintain(&a, &.{});
++    try std.testing.expectEqual(@as(u64, 1), s.counts.superseded); // only A@6
++    try std.testing.expectEqual(@as(u32, 10), s.find(&a, &.{}, &.{}).?.at);
++    try std.testing.expectEqual(@as(u32, 7), s.find(&fork, &.{}, &.{}).?.at);
++    try std.testing.expectEqual(@as(u32, 5), s.find(&b, &.{}, &.{}).?.at);
++    try std.testing.expectEqual(@as(u32, 4), s.find(&.{ 1, 2, 3, 4, 100 }, &.{}, &.{}).?.at);
++    try std.testing.expectEqual(@as(u32, 3), s.find(&.{ 1, 2, 3, 100 }, &.{}, &.{}).?.at);
++}
++
++test "GC hundreds of growing turns stay bounded and reproduce cold output" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.gcSnapshots(), .{ .gc = true, .min_prompt = 0 }, 10000);
++    defer s.deinit();
++    var tokens: [600]u32 = undefined;
++    for (&tokens, 0..) |*v, i| v.* = @intCast(i + 1);
++    for (4..600) |len| {
++        const p = tokens[0..len];
++        const plan = try s.begin(arena.allocator(), p, @intCast(len - 1), &.{}, &.{}, null, &.{});
++        try std.testing.expectEqual(fresh(p), f.pass(&s, p, plan));
++        s.maintain(p, &.{});
++        try std.testing.expect(s.entries.items.len <= 2);
++        if (len > 4) try std.testing.expect(plan.from > 0);
++    }
++    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
++}
++
++test "GC does not force-delete two protected branches under a tiny budget" {
++    const gpa = std.testing.allocator;
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.gcSnapshots(), .{ .gc = true, .min_prompt = 0 }, 220);
++    defer s.deinit();
++    try keepGc(&f, &s, &.{ 1, 2, 3, 4, 5, 9 }, 5);
++    try keepGc(&f, &s, &.{ 2, 2, 3, 4, 5, 9 }, 5);
++    s.maintain(&.{ 2, 2, 3, 4, 5, 9 }, &.{});
++    try std.testing.expectEqual(@as(u64, 210), s.held);
++    try std.testing.expectEqual(@as(u64, 0), s.counts.gc_evicted);
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++}
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! DeepSeek-V4.1-Flash behind TensorFold 1.0's lane core (core/lanes): the round loop picks each round's streams and
+ //! windows and keeps the accepted rows; this backend runs them on the port's model (model.zig) with the served lane's
+ //! arithmetic. Each stream has a pool slot (its window rings, positional stores and drafter rings) and an extent of
+@@ -24,6 +25,7 @@
+ const sampling = @import("sampling.zig");
+ const link = @import("link.zig");
+ const cuda = @import("cuda");
++const layout = @import("pool_layout.zig");
+ 
+ const be = lanes.backend;
+ const Model = model.Model;
+@@ -40,7 +42,7 @@
+ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10, extent_move = 11 };
+ 
+ /// A frame being written.
+ pub const Wire = struct {
+@@ -222,7 +224,7 @@
+ /// replay): the slot's own part on the device (Model.snapCopy), and the extent its compressed rows stay in,
+ /// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
+ /// and the prompt runs from 0).
+-pub const Snap = struct { id: u64, at: usize, base: usize, buf: cuda.DeviceBuffer, stale: bool = false };
++pub const Snap = struct { id: u64, at: usize, base: usize, buf: cuda.DeviceBuffer, stale: bool = false, used: u64 = 0, prefix_key: u64 = 0 };
+ 
+ /// A resumed stream may overwrite its tail only if no other retained prefix owns it.
+ /// Older checkpoints ending at or before lo remain valid and need no relocation.
+@@ -258,6 +260,7 @@
+     trace_prefill: bool = false,
+     active_fill: ?usize = null, // owner of shared prompt workspace and Engram read-ahead
+     interleaved_vtable: be.Backend.VTable = undefined,
++    snap_clock: u64 = 0,
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
+         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+@@ -398,13 +401,19 @@
+                 std.log.warn("dsv41 prompt cache: restore unavailable (id {d}, stale {}, base {d}, at {d}, prompt {d})", .{ sn.id, sn.stale, sn.base, sn.at, len });
+             }
+         }
++        if (kept) |sn| if (moved) {
++            // Reclaim fragmentation without first invalidating B or requiring a
++            // second full A. This is metadata-only planning, then ordered TP copies.
++            if (try self.repackRestore(taken[0..nt], size, sn)) moved = false;
++        };
+         const base = if (kept != null and !moved) kept.?.base else self.placeKept(taken[0..nt], size, kept) catch |err| blk: {
+             if (err != error.KeptExtentFull) return err;
+             // Even after evicting other idle snapshots, source and destination cannot
+             // coexist. Explicitly give up this restore before reclaiming its source.
+             const sn = kept.?;
++            self.reportLayout(taken[0..nt], size, sn, "restore-failed");
+             std.log.warn("dsv41 prompt cache: restore unavailable (pool pressure, id {d}, at {d}, extent {d}, pool {d})", .{ sn.id, sn.at, size, m.pool_cap });
+-            sn.stale = true;
++            self.invalidate(sn, "restore-capacity");
+             kept = null;
+             s.reuse_failed = true;
+             break :blk try self.placeKept(taken[0..nt], size, null);
+@@ -412,6 +421,7 @@
+         // the rows this stream writes are no other kept state's
+         self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
+         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
++        std.log.info("dsv41 cache allocation: request={s} prompt={d} max_new={d} reservation={d} base={d} cached={d} snapshot={d} cap={d}", .{ s.id, len, s.max_new, size, base, if (kept) |sn| sn.at else 0, if (kept) |sn| sn.id else 0, m.pool_cap });
+         self.used[slot] = true;
+         errdefer {
+             self.pauseFill();
+@@ -807,35 +817,195 @@
+         return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+     }
+ 
+-    /// The first extent that fits around the live streams and the kept states; the oldest kept states go stale
+-    /// until it does.
++    /// Preserve retained snapshots by moving only idle data. The planner never
++    /// selects a destination that overwrites a live lane. With no live lanes it
++    /// may shift several retained groups to make room for the source's new tail.
++    fn planRestore(self: *Lanes, live: []const [2]usize, size: usize, source: *Snap) !?layout.Plan {
++        const gpa = self.gpa;
++        var active: [max_streams]layout.Range = undefined;
++        for (live, 0..) |r, i| active[i] = .{ .lo = r[0], .hi = r[1] };
++        var retained: std.ArrayList(layout.Range) = .empty;
++        defer retained.deinit(gpa);
++        while (true) {
++            retained.clearRetainingCapacity();
++            for (self.snaps.items) |sn| if (!sn.stale)
++                try retained.append(gpa, .{ .lo = sn.base, .hi = sn.base + sn.at });
++            if (try layout.restore(gpa, self.m.pool_cap, model.chunk_rows, active[0..live.len], retained.items, .{ .lo = source.base, .hi = source.base + source.at }, size)) |plan| return plan;
++            // Partially prefilled streams reserve their entire extent too. The
++            // scheduler retries ContextFull only after another owner finishes.
++            // Never destroy idle snapshots while waiting for an active owner.
++            if (live.len > 0) {
++                self.reportLayout(live, size, source, "wait-for-active-owner");
++                return error.ContextFull;
++            }
++            // Retained data really exceeds capacity (or a longer fork blocks the
++            // source). Reclaim one idle LRU and retry overlap-safe planning,
++            // rather than requiring a second full source extent as placeKept did.
++            if (!try self.reclaimGroup(source)) {
++                self.reportLayout(live, size, source, "no-preserving-plan");
++                return null;
++            }
++        }
++    }
++
++    /// Reused by cold placement and restore. Both TP ranks execute the same
++    /// extent_move frames before any new prefill or decode can observe the layout.
++    fn applyPlan(self: *Lanes, plan: *const layout.Plan) !void {
++        const gpa = self.gpa;
++        if (plan.moves.items.len == 0) return;
++        self.m.joinAhead();
++        // On a failed partial move, no snapshot touching the changed rows may be
++        // offered as valid later. Report the error; never silently call it a hit.
++        errdefer for (plan.moves.items) |p| {
++            self.staleOver(p.from, p.from + p.len, null);
++            self.staleOver(p.to, p.to + p.len, null);
++        };
++        for (plan.moves.items) |p| {
++            std.log.info("dsv41 pool move: from={d} to={d} tokens={d}", .{ p.from, p.to, p.len });
++            if (try self.begin(.extent_move)) {
++                try self.wire.int(gpa, u64, p.from);
++                try self.wire.int(gpa, u64, p.to);
++                try self.wire.int(gpa, u64, p.len);
++                try self.flush();
++            }
++            try self.m.copyExtent(p.from, p.to, p.len);
++        }
++        // All copies have been queued in the same order on both ranks. No new
++        // prefill/decode is admitted between these updates and the source restore.
++        // The follower stores ring buffers by ID; physical coordinates come in
++        // every snap_restore frame, so no follower snapshot metadata can go stale.
++        for (self.snaps.items) |sn| if (!sn.stale) {
++            sn.base = plan.relocated(.{ .lo = sn.base, .hi = sn.base + sn.at });
++        };
++    }
++
++    fn repackRestore(self: *Lanes, live: []const [2]usize, size: usize, source: *Snap) !bool {
++        const gpa = self.gpa;
++        var plan = (try self.planRestore(live, size, source)) orelse return false;
++        defer plan.deinit(gpa);
++        const old_base = source.base;
++        try self.applyPlan(&plan);
++        std.debug.assert(source.base == plan.base);
++        std.log.info("dsv41 prompt cache: preserving relocation id {d}, base {d} -> {d}, at {d}, reservation {d}, moves {d}, compacted {}", .{ source.id, old_base, source.base, source.at, size, plan.moves.items.len, plan.compacted });
++        return true;
++    }
++
++    fn reportLayout(self: *const Lanes, live: []const [2]usize, size: usize, source: *const Snap, reason: []const u8) void {
++        if (@import("builtin").is_test) return;
++        std.log.warn("dsv41 pool layout: reason={s} source={d} base={d} at={d} reservation={d} cap={d}", .{ reason, source.id, source.base, source.at, size, self.m.pool_cap });
++        for (live, 0..) |r, i| std.log.warn("dsv41 pool layout: live={d} lo={d} hi={d}", .{ i, r[0], r[1] });
++        for (self.snaps.items) |sn| std.log.warn("dsv41 pool layout: snapshot={d} lo={d} hi={d} stale={} used={d}", .{ sn.id, sn.base, sn.base + sn.at, sn.stale, sn.used });
++    }
++
++    fn invalidate(_: *Lanes, sn: *Snap, reason: []const u8) void {
++        if (sn.stale) return;
++        sn.stale = true;
++        if (!@import("builtin").is_test)
++            std.log.info("dsv41 cache invalidation: reason={s} snapshot={d} prefix_key={x} base={d} tokens={d} used={d}", .{ reason, sn.id, sn.prefix_key, sn.base, sn.at, sn.used });
++    }
++
++    /// Reclaim one physical group, not a succession of aliases that free no
++    /// space. The selected restore source and its aliases remain protected.
++    fn reclaimGroup(self: *Lanes, source: ?*Snap) !bool {
++        var kept: std.ArrayList(layout.Retained) = .empty;
++        defer kept.deinit(self.gpa);
++        for (self.snaps.items) |sn| if (!sn.stale)
++            try kept.append(self.gpa, .{ .range = .{ .lo = sn.base, .hi = sn.base + sn.at }, .used = sn.used });
++        var pin: [1]layout.Range = undefined;
++        const npin: usize = if (source) |sn| blk: {
++            pin[0] = .{ .lo = sn.base, .hi = sn.base + sn.at };
++            break :blk 1;
++        } else 0;
++        if (try layout.oldestGroup(self.gpa, kept.items, pin[0..npin])) |group| {
++            var count: usize = 0;
++            for (self.snaps.items) |sn| if (!sn.stale and group.contains(.{ .lo = sn.base, .hi = sn.base + sn.at })) {
++                self.invalidate(sn, "capacity-group");
++                count += 1;
++            };
++            if (!@import("builtin").is_test)
++                std.log.info("dsv41 cache reclaim: reason=capacity-group snapshots={d} released_tokens={d} lo={d} hi={d}", .{ count, group.hi - group.lo, group.lo, group.hi });
++            return true;
++        }
++        // A longer fork can overlap the source. Discard only that fork, never
++        // the source or its contained aliases, then retry preservation planning.
++        if (source) |src| {
++            const protected: layout.Range = .{ .lo = src.base, .hi = src.base + src.at };
++            var victim: ?*Snap = null;
++            for (self.snaps.items) |sn| {
++                if (sn.stale or sn == src or protected.contains(.{ .lo = sn.base, .hi = sn.base + sn.at })) continue;
++                if (victim == null or sn.used < victim.?.used) victim = sn;
++            }
++            if (victim) |sn| {
++                self.invalidate(sn, "capacity-fork");
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /// First-fit is the fast path. When it fails, wait for live owners, compact
++    /// idle extents, and only then reclaim a cold physical group if necessary.
+     fn placeKept(self: *Lanes, live: []const [2]usize, size: usize, source: ?*Snap) !usize {
+-        // A live-stream capacity refusal will be retried by the host; do not destroy
+-        // retained states while waiting for those streams to finish.
+         if (place(live, size, self.m.pool_cap) == null) return error.ContextFull;
+         const gpa = self.gpa;
+         var used: std.ArrayList([2]usize) = .empty;
+         defer used.deinit(gpa);
++        var retained: std.ArrayList(layout.Range) = .empty;
++        defer retained.deinit(gpa);
+         while (true) {
+             used.clearRetainingCapacity();
++            retained.clearRetainingCapacity();
+             try used.appendSlice(gpa, live);
+-            for (self.snaps.items) |sn| if (!sn.stale) try used.append(gpa, .{ sn.base, sn.base + sn.at });
+-            if (place(used.items, size, self.m.pool_cap)) |b| return b;
+-            const oldest = for (self.snaps.items) |sn| {
+-                if (!sn.stale and sn != source) break sn;
+-            } else return if (source != null) error.KeptExtentFull else error.ContextFull;
+-            oldest.stale = true;
++            for (self.snaps.items) |sn| if (!sn.stale) {
++                try used.append(gpa, .{ sn.base, sn.base + sn.at });
++                try retained.append(gpa, .{ .lo = sn.base, .hi = sn.base + sn.at });
++            };
++            if (place(used.items, size, self.m.pool_cap)) |base| return base;
++            if (live.len != 0) {
++                if (!@import("builtin").is_test)
++                    std.log.info("dsv41 cache admission: reason=wait-preserve-cache reservation={d} live={d} snapshots={d} cap={d}", .{ size, live.len, retained.items.len, self.m.pool_cap });
++                return error.ContextFull;
++            }
++            if (source == null) {
++                if (try layout.allocate(gpa, self.m.pool_cap, model.chunk_rows, &.{}, retained.items, size)) |cold_plan| {
++                    var plan = cold_plan;
++                    defer plan.deinit(gpa);
++                    try self.applyPlan(&plan);
++                    if (!@import("builtin").is_test)
++                        std.log.info("dsv41 cache admission: reason=cold-compaction reservation={d} base={d} moves={d} snapshots={d}", .{ size, plan.base, plan.moves.items.len, retained.items.len });
++                    return plan.base;
++                }
++            }
++            if (!try self.reclaimGroup(source)) return if (source != null) error.KeptExtentFull else error.ContextFull;
+         }
+     }
+ 
+     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
+     fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
+         for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
+-            sn.stale = true;
++            self.invalidate(sn, "overwritten-extent");
+         };
+     }
+ 
+     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
++    pub fn snapValidFn(ptr: *anyopaque, saved: *anyopaque) bool {
++        const self = of(ptr);
++        const sn: *Snap = @ptrCast(@alignCast(saved));
++        return std.mem.indexOfScalar(*Snap, self.snaps.items, sn) != null and !sn.stale;
++    }
++
++    pub fn snapUsableFn(ptr: *anyopaque, saved: *anyopaque, prompt_len: usize) bool {
++        const sn: *Snap = @ptrCast(@alignCast(saved));
++        return of(ptr).usable(sn, prompt_len);
++    }
++
++    pub fn snapTouchFn(ptr: *anyopaque, saved: *anyopaque) void {
++        const self = of(ptr);
++        const sn: *Snap = @ptrCast(@alignCast(saved));
++        self.snap_clock += 1;
++        sn.used = self.snap_clock;
++    }
++
+     pub fn snapBytesFn(ptr: *anyopaque, at: u32) u64 {
+         _ = at;
+         return of(ptr).m.snapBytes();
+@@ -849,9 +1019,10 @@
+         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+         const sn = try self.gpa.create(Snap);
+         errdefer self.gpa.destroy(sn);
+-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
++        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .prefix_key = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(s.prompt()[0..at])) };
+         errdefer sn.buf.free();
+         try self.snaps.append(self.gpa, sn);
++        snapTouchFn(ptr, sn);
+         self.next_snap += 1;
+         if (try self.begin(.snap_save)) {
+             try self.wire.int(self.gpa, u64, sn.id);
+@@ -859,6 +1030,7 @@
+             try self.flush();
+         }
+         try self.m.snapCopy(l.slot, sn.buf.ptr, true);
++        std.log.info("dsv41 cache saved: snapshot={d} prefix_key={x} base={d} tokens={d}", .{ sn.id, sn.prefix_key, sn.base, sn.at });
+         return sn;
+     }
+ 
+@@ -940,6 +1112,7 @@
+             8 => .fill_images,
+             9 => .done,
+             10 => .fill_resume,
++            11 => .extent_move,
+             else => return error.BadFrame,
+         };
+         if (try r.int(u64) != step) return error.OutOfStep;
+@@ -1059,6 +1232,14 @@
+                     b.free();
+                 }
+             },
++            .extent_move => {
++                const from: usize = @intCast(try r.int(u64));
++                const to: usize = @intCast(try r.int(u64));
++                const at: usize = @intCast(try r.int(u64));
++                // A failed preservation copy cannot be followed by inference using
++                // partially changed rows. Fail the worker instead of hiding it.
++                try m.copyExtent(from, to, at);
++            },
+             .done => return,
+         }
+     }
+@@ -1168,3 +1349,104 @@
+     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, null));
+     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, .{ .seed = 3, .temperature = 0 }));
+ }
++
++test "pool pressure uses actual recency and pins the restore source" {
++    var m: Model = undefined;
++    m.pool_cap = 16384;
++    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
++    defer ln.snaps.deinit(ln.gpa);
++    var source: Snap = .{ .id = 1, .base = 0, .at = 4096, .buf = undefined, .used = 1 };
++    var hot: Snap = .{ .id = 2, .base = 4096, .at = 4096, .buf = undefined, .used = 100 };
++    var cold: Snap = .{ .id = 3, .base = 8192, .at = 4096, .buf = undefined, .used = 2 };
++    try ln.snaps.appendSlice(ln.gpa, &.{ &source, &hot, &cold });
++    try std.testing.expectEqual(@as(usize, 8192), try ln.placeKept(&.{}, 8192, &source));
++    try std.testing.expect(!source.stale);
++    try std.testing.expect(!hot.stale);
++    try std.testing.expect(cold.stale);
++}
++
++test "cold admission waits for active owner without evicting idle neighbors" {
++    var m: Model = undefined;
++    m.pool_cap = 16384;
++    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
++    defer ln.snaps.deinit(ln.gpa);
++    var active: Snap = .{ .id = 1, .base = 0, .at = 4096, .buf = undefined };
++    var idle: Snap = .{ .id = 2, .base = 8192, .at = 4096, .buf = undefined, .used = 1 };
++    try ln.snaps.appendSlice(ln.gpa, &.{ &active, &idle });
++    try std.testing.expectError(error.ContextFull, ln.placeKept(&.{.{ 0, 8192 }}, 8192, null));
++    try std.testing.expect(!active.stale);
++    try std.testing.expect(!idle.stale);
++    try std.testing.expect(Lanes.snapValidFn(&ln, &active));
++    try std.testing.expect(Lanes.snapValidFn(&ln, &idle));
++    Lanes.snapTouchFn(&ln, &active);
++    try std.testing.expectEqual(@as(u64, 1), active.used);
++}
++
++test {
++    _ = @import("pool_layout.zig");
++}
++
++test "extent_move TP frame reconstructs identical overlap-safe operations on both ranks" {
++    const gpa = std.testing.allocator;
++    var w: Wire = .{};
++    defer w.deinit(gpa);
++    for ([_]layout.Move{ .{ .from = 8, .to = 12, .len = 12 }, .{ .from = 12, .to = 4, .len = 12 } }) |move| {
++        try w.begin(gpa, .extent_move, 37);
++        try w.int(gpa, u64, move.from);
++        try w.int(gpa, u64, move.to);
++        try w.int(gpa, u64, move.len);
++        var reader: Reader = .{ .b = w.buf.items };
++        try std.testing.expectEqual(@as(u8, 10), @backingInt(Kind.fill_resume));
++        try std.testing.expectEqual(@as(u8, 11), try reader.int(u8));
++        try std.testing.expectEqual(@as(u64, 37), try reader.int(u64));
++        const from: usize = @intCast(try reader.int(u64));
++        const to: usize = @intCast(try reader.int(u64));
++        const len: usize = @intCast(try reader.int(u64));
++        try std.testing.expectEqual(@as(usize, 0), reader.rest().len);
++        for ([_]usize{ 1, 2, 4 }) |ratio| {
++            var rank0: [32]u32 = undefined;
++            for (&rank0, 0..) |*v, i| v.* = @intCast(i * 31 + ratio);
++            const original = rank0;
++            var rank1 = rank0;
++            var head_parts = layout.CopyParts.init(move.from / ratio, move.to / ratio, move.len / ratio);
++            var worker_parts = layout.CopyParts.init(from / ratio, to / ratio, len / ratio);
++            while (head_parts.next()) |p| @memcpy(rank0[p.to..][0..p.len], rank0[p.from..][0..p.len]);
++            while (worker_parts.next()) |p| @memcpy(rank1[p.to..][0..p.len], rank1[p.from..][0..p.len]);
++            try std.testing.expectEqualSlices(u32, &rank0, &rank1);
++            try std.testing.expectEqualSlices(u32, original[from / ratio ..][0 .. len / ratio], rank1[to / ratio ..][0 .. len / ratio]);
++        }
++    }
++}
++
++test "restore waits for partial live owners without invalidating either cached branch" {
++    var m: Model = undefined;
++    m.pool_cap = 1048576;
++    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
++    defer ln.snaps.deinit(ln.gpa);
++    var a: Snap = .{ .id = 1, .base = 0, .at = 442368, .buf = undefined };
++    var b: Snap = .{ .id = 2, .base = 442368, .at = 188416, .buf = undefined };
++    try ln.snaps.appendSlice(ln.gpa, &.{ &a, &b });
++    try std.testing.expectError(error.ContextFull, ln.planRestore(&.{.{ 442368, 665600 }}, 477184, &a));
++    try std.testing.expect(!a.stale and !b.stale);
++    var p = (try ln.planRestore(&.{}, 477184, &a)).?;
++    defer p.deinit(ln.gpa);
++    try std.testing.expectEqual(@as(usize, 0), p.base);
++    try std.testing.expectEqual(@as(usize, 477184), p.relocated(.{ .lo = b.base, .hi = b.base + b.at }));
++    try std.testing.expect(!a.stale and !b.stale);
++}
++
++test "actual retained capacity pressure evicts idle LRU then restores without a second full source" {
++    var m: Model = undefined;
++    m.pool_cap = 16384;
++    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
++    defer ln.snaps.deinit(ln.gpa);
++    var a: Snap = .{ .id = 1, .base = 0, .at = 8192, .buf = undefined, .used = 1 };
++    var hot: Snap = .{ .id = 2, .base = 8192, .at = 4096, .buf = undefined, .used = 20 };
++    var cold: Snap = .{ .id = 3, .base = 12288, .at = 4096, .buf = undefined, .used = 2 };
++    try ln.snaps.appendSlice(ln.gpa, &.{ &a, &hot, &cold });
++    var p = (try ln.planRestore(&.{}, 12288, &a)).?;
++    defer p.deinit(ln.gpa);
++    try std.testing.expect(!a.stale and !hot.stale and cold.stale);
++    try std.testing.expectEqual(@as(usize, 0), p.base);
++    try std.testing.expectEqual(@as(usize, 12288), p.relocated(.{ .lo = hot.base, .hi = hot.base + hot.at }));
++}
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -1,3 +1,4 @@
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! One TP rank of DeepSeek-V4.1-Flash loaded for serving: the weights, kernels, caches and buffers the layer gate sets
+ //! up (layer_main.zig), for a pool of draft.max_streams streams (MultiDecoder's slots: each stream's window rings,
+ //! positional stores and drafter rings in its slot, its compressed rows in its extent of one shared plane), and the
+@@ -470,8 +471,17 @@
+     /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
+     /// codes and scales and its index keys, the rows view() places at those positions.
+     pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
++        if (from > m.pool_cap or to > m.pool_cap or at > m.pool_cap - from or at > m.pool_cap - to)
++            return error.BadView;
++        if (from == to or at == 0) return;
+         const c = m.eng.c;
+         const cs = &m.caches;
++        // Validate the complete move before enqueueing any partial plane copy.
++        for (m.eng.w.layers) |lay| {
++            if (lay.comp_wkv == null) continue;
++            const r: usize = lay.ratio;
++            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
++        }
+         for (m.eng.w.layers, 0..) |lay, i| {
+             if (lay.comp_wkv == null) continue;
+             const r: usize = lay.ratio;
+@@ -488,7 +498,9 @@
+ 
+     fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
+         const d = m.ctx.d;
+-        try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");
++        var parts = @import("pool_layout.zig").CopyParts.init(from, to, n);
++        while (parts.next()) |p|
++            try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + p.to * row, plane + p.from * row, p.len * row, m.stream.handle), "cuMemcpyDtoDAsync");
+     }
+ 
+     fn copyState(m: *Model, live: u64, kept: u64, bytes: usize, save: bool) !void {
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! DeepSeek-V4.1-Flash behind the native CUDA family interface, tensor parallel over two GPUs: the server's process is
+ //! rank 0 (the lane core over lanes.zig's Backend on model.zig), rank 1 is `tf-dsv41-lanes` following it on the other
+ //! node (the same model directory, rank cache, kit, pool and port). The ranks link over TCP and NCCL; the inputs
+@@ -74,6 +75,10 @@
+     save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
+     restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
+     drop: *const fn (*anyopaque, *anyopaque) void,
++    valid: ?*const fn (*anyopaque, *anyopaque) bool = null,
++    usable: ?*const fn (*anyopaque, *anyopaque, usize) bool = null,
++    touch: ?*const fn (*anyopaque, *anyopaque) void = null,
++    gc: bool = true,
+ };
+ 
+ /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
+@@ -158,7 +163,7 @@
+     st.lanes.vision = st.vision;
+     // the pool is the model's (preallocated): a stream takes no device memory of its own
+     const L = lanes_mod.Lanes;
+-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
++    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .valid = L.snapValidFn, .usable = L.snapUsableFn, .touch = L.snapTouchFn };
+     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+ }
+ 
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! CUDA family registration, device setup, memory admission and the native lane host.
+ const std = @import("std");
+ const cuda = @import("cuda");
+@@ -384,7 +385,11 @@
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+         if (want > 0) {
+             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
+-            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, want);
++            if (@hasField(@TypeOf(sn), "valid")) h.snap_vt.valid = sn.valid;
++            if (@hasField(@TypeOf(sn), "usable")) h.snap_vt.usable = sn.usable;
++            if (@hasField(@TypeOf(sn), "touch")) h.snap_vt.touch = sn.touch;
++            const gc = if (@hasField(@TypeOf(sn), "gc")) sn.gc else false;
++            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .gc = gc }, want);
+         }
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+--- a/zig/src/server/dashboard.html
++++ b/zig/src/server/dashboard.html
+@@ -1,3 +1,4 @@
++<!-- Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE. -->
+ <!doctype html>
+ <html lang="en">
+ <head>
+@@ -13,7 +14,7 @@
+ </head>
+ <body><main><h1>TensorFold Dashboard</h1><p>Live server activity, refreshed once per second.</p><section class="grid" id="stats"></section></main>
+ <script>
+-const fields=[['running','Running'],['waiting','Waiting'],['generation_tokens_running','Tokens in flight'],['generation_tokens_total','Tokens finished'],['decode_tokens_per_second','Decode tokens/s'],['prefill_tokens_per_second','Prefill tokens/s'],['decode_rounds_total','Decode rounds']];
+-function show(data){const memory=data.memory||{};const values={...data};const cards=fields.map(([k,label])=>'<article class="card"><div class="label">'+label+'</div><div class="value">'+(values[k]??0)+'</div></article>');if(memory.peak!=null)cards.push('<article class="card"><div class="label">Peak memory</div><div class="value">'+memory.peak+'</div></article>');document.querySelector('#stats').innerHTML=cards.join('')}
++const fields=[['running','Running'],['waiting','Waiting'],['generation_tokens_running','Tokens in flight'],['generation_tokens_total','Tokens finished'],['decode_tokens_per_second','Decode tokens/s'],['prefill_tokens_per_second','Prefill tokens/s'],['decode_rounds_total','Decode rounds'],['prompt_tokens_cached_total','Prompt tokens reused'],['prompt_tokens_recomputed_total','Prompt tokens recomputed']];
++function show(data){const memory=data.memory||{};const values={...data};const cards=fields.map(([k,label])=>'<article class="card"><div class="label">'+label+'</div><div class="value">'+(values[k]??0)+'</div></article>');if(memory.peak!=null)cards.push('<article class="card"><div class="label">Peak memory</div><div class="value">'+memory.peak+'</div></article>');const c=data.prompt_cache;if(c){for(const [k,label] of [['states','Cache checkpoints'],['superseded','Old checkpoints replaced'],['invalidated','Invalidated checkpoints'],['watermark_evicted','Watermark evictions']])cards.push('<article class="card"><div class="label">'+label+'</div><div class="value">'+c[k]+'</div></article>')}document.querySelector('#stats').innerHTML=cards.join('')}
+ async function poll(){try{const r=await fetch('/stats?poll=1');if(r.ok)show(await r.json())}catch(_){}}poll();setInterval(poll,1000)
+ </script></body></html>
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! Prometheus text for GET /metrics, family for family as the Python server writes it.
+ const std = @import("std");
+ const builtin = @import("builtin");
+@@ -123,6 +124,17 @@
+         try gauge(w, "generation_tokens_running", "gauge", "Generated tokens held by live streams.", status.generation_tokens);
+         try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
+         try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests served from a kept prefix; the prompt cache's hits.", snap.cached);
++        try gauge(w, "prompt_tokens_recomputed_total", "counter", "Uncached prompt tokens of finished requests.", snap.prompt -| snap.cached);
++        if (status.prompt_cache) |c| {
++            try gauge(w, "prompt_cache_states", "gauge", "Retained checkpoint snapshots, not physical KV blocks.", c.states);
++            try gauge(w, "prompt_cache_snapshot_bytes", "gauge", "Snapshot copies only; excludes the compressed context pool.", c.held_bytes);
++            try gauge(w, "prompt_cache_budget_bytes", "gauge", "Snapshot budget, not total context storage.", c.budget_bytes);
++            try gauge(w, "prompt_cache_evicted_total", "counter", "All removed checkpoints; inspect reason counters.", c.evicted);
++            try gauge(w, "prompt_cache_invalidated_total", "counter", "Removed checkpoints whose physical state became invalid.", c.invalidated);
++            try gauge(w, "prompt_cache_superseded_total", "counter", "Removed older checkpoints superseded along a conversation.", c.superseded);
++            try gauge(w, "prompt_cache_watermark_evicted_total", "counter", "Removed checkpoints due to snapshot budget watermarks.", c.watermark_evicted);
++            try gauge(w, "prompt_cache_restore_failed_total", "counter", "Failed checkpoint restores.", c.failed);
++        }
+         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
+         const live = streams[0..@min(status.streams, streams.len)];
+         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
+@@ -240,7 +252,7 @@
+ test "metrics record rounds prefill and per-token timing" {
+     const gpa = std.testing.allocator;
+     var m: Metrics = .{ .gpa = gpa };
+-    m.note(std.testing.io, 10, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 1_024_000_000, 3));
++    m.note(std.testing.io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 1_024_000_000, 3));
+     try std.testing.expectEqual(@as(u64, 2), m.rounds);
+     try std.testing.expectEqual(@as(u64, 1), m.prefill.n);
+     try std.testing.expectEqual(@as(u64, 1), m.tpot.n);
+@@ -276,10 +288,10 @@
+     }
+ };
+ 
+-test "render exposes live counters, rounds, prefill and TPOT without cache family" {
++test "render exposes live counters and token totals without optional cache storage" {
+     const gpa = std.testing.allocator;
+     var m: Metrics = .{ .gpa = gpa };
+-    m.note(std.testing.io, 10, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 3_000_000_000, 3));
++    m.note(std.testing.io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 3_000_000_000, 3));
+     var stub: RenderStub = .{};
+     var out: std.Io.Writer.Allocating = .init(gpa);
+     defer out.deinit();
+@@ -289,7 +301,9 @@
+     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:decode_rounds_total 2") != null);
+     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_prefill_seconds_sum 0.25") != null);
+     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_time_per_output_token_seconds_sum 1") != null);
+-    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_tokens_cached_total") == null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_tokens_cached_total 0\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_tokens_recomputed_total 10\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_states") == null);
+     try std.testing.expect(std.mem.indexOf(u8, body, "device_memory_bytes") == null); // unknown memory: no gauge
+     stub.memory_value = .{ .active = 7 << 30, .peak = 8 << 30 };
+     var known: std.Io.Writer.Allocating = .init(gpa);
+@@ -323,7 +337,7 @@
+     try std.testing.expect(failing.has_induced_failure);
+     failing.fail_index = std.math.maxInt(usize);
+     m.httpRequest(io, "client", 200);
+-    m.note(io, 10, 3, 0, 0, 2, 1.0, null, null, 0.25, null);
++    m.note(io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, null);
+     try m.render(io, &out.writer, stub.engine(), 4096);
+     try std.testing.expect(std.mem.indexOf(u8, out.written(), "requests_total{key=\"client\",status=\"200\"} 2") != null);
+     try std.testing.expect(std.mem.indexOf(u8, out.written(), "prompt_tokens_total 10") != null);
+@@ -354,3 +368,22 @@
+     try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
+     try std.testing.expectEqual(allocations, failing.allocations);
+ }
++
++test "cache metrics distinguish recomputation replacement invalidation and budget eviction" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    m.note(std.testing.io, 10000, 8192, 3, 0, 0, 2, 1.0, null, null, 0.25, null);
++    var stub: RenderStub = .{};
++    stub.status_value.prompt_cache = .{ .states = 3, .held_bytes = 123, .budget_bytes = 456,
++        .evicted = 9, .invalidated = 2, .superseded = 6, .watermark_evicted = 1, .failed = 0 };
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    for ([_][]const u8{
++        "prompt_tokens_cached_total 8192\n", "prompt_tokens_recomputed_total 1808\n",
++        "prompt_cache_states 3\n", "prompt_cache_snapshot_bytes 123\n", "prompt_cache_budget_bytes 456\n",
++        "prompt_cache_evicted_total 9\n", "prompt_cache_invalidated_total 2\n",
++        "prompt_cache_superseded_total 6\n", "prompt_cache_watermark_evicted_total 1\n",
++        "prompt_cache_restore_failed_total 0\n",
++    }) |expected| try std.testing.expect(std.mem.indexOf(u8, out.written(), expected) != null);
++}
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -1,6 +1,7 @@
+ // Modifications Copyright 2026 ywytrew; licensed under Apache-2.0.
+ // Based on TensorFold and Bertholomus AI; see NOTICE and docs/dsv41-rr/CHANGES.md.
+ // Modified in dsv41-tensorfold-rr, 2026-10-17.
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
+ //! GET /health, /v1/models, /metrics, and the opt-in dashboard.
+ const std = @import("std");
+ const api = @import("engine_api");
+@@ -84,12 +85,15 @@
+     const memory = srv.engine.memory(false);
+     srv.metrics.mutex.lockUncancelable(srv.io);
+     const prompt = srv.metrics.prompt;
++    const cached = srv.metrics.cached;
+     const generation = srv.metrics.generation;
+     const drafted = srv.metrics.drafted;
+     const accepted = srv.metrics.accepted;
+     const rounds = srv.metrics.rounds;
+     srv.metrics.mutex.unlock(srv.io);
+     const body = statsSnapshot(a, status, memory, prompt, generation, drafted, accepted, rounds) catch return;
++    body.object.put(a, "prompt_tokens_cached_total", json.intValue(a, cached) catch return) catch return;
++    body.object.put(a, "prompt_tokens_recomputed_total", json.intValue(a, prompt -| cached) catch return) catch return;
+     conn.quiet_log = true;
+     routes.sendValue(conn, a, 200, body);
+ }
+@@ -106,6 +110,12 @@
+     try o.put(a, "mtp_drafted_total", try json.intValue(a, drafted));
+     try o.put(a, "mtp_accepted_total", try json.intValue(a, accepted));
+     try o.put(a, "decode_rounds_total", try json.intValue(a, rounds));
++    if (status.prompt_cache) |c| {
++        const cache = try json.newObject(a);
++        inline for (.{ "states", "held_bytes", "budget_bytes", "hits", "misses", "evicted", "invalidated", "superseded", "watermark_evicted", "failed" }) |key|
++            try cache.put(a, key, try json.intValue(a, @field(c, key)));
++        try o.put(a, "prompt_cache", .{ .object = cache });
++    }
+     const mem = try json.newObject(a);
+     if (memory) |m| {
+         try mem.put(a, "active", try json.intValue(a, m.active));
+@@ -127,3 +137,17 @@
+         try std.testing.expect(object.contains(key));
+     try std.testing.expectEqual(@as(usize, 0), object.get("memory").?.object.count());
+ }
++
++test "stats snapshot preserves separate cache removal reasons" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const value = try statsSnapshot(arena.allocator(), .{ .prompt_cache = .{
++        .states = 3, .held_bytes = 123, .budget_bytes = 456, .hits = 7, .misses = 8,
++        .evicted = 9, .invalidated = 2, .superseded = 6, .watermark_evicted = 1, .failed = 0,
++    } }, null, 10000, 3, 0, 0, 2);
++    const c = value.object.get("prompt_cache").?.object;
++    try std.testing.expectEqualStrings("2", c.get("invalidated").?.int);
++    try std.testing.expectEqualStrings("6", c.get("superseded").?.int);
++    try std.testing.expectEqualStrings("1", c.get("watermark_evicted").?.int);
++    try std.testing.expectEqualStrings("0", c.get("failed").?.int);
++}
+--- /dev/null
++++ b/zig/src/families/dsv41/pool_layout.zig
+@@ -0,0 +1,420 @@
++// Cache maintenance modifications, ywytrew, 2026-10-26. Apache-2.0; see NOTICE.
++//! Restore placement without requiring a second full copy of the source extent.
++//! Pure host planning: no cache eviction or pointer mutation until copies succeed.
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++
++pub const Range = struct {
++    lo: usize,
++    hi: usize,
++    pub fn contains(a: Range, b: Range) bool {
++        return a.lo <= b.lo and b.hi <= a.hi;
++    }
++    pub fn overlaps(a: Range, b: Range) bool {
++        return a.lo < b.hi and b.lo < a.hi;
++    }
++    fn less(_: void, a: Range, b: Range) bool {
++        return a.lo < b.lo or (a.lo == b.lo and a.hi < b.hi);
++    }
++};
++
++pub const Move = struct { from: usize, to: usize, len: usize };
++pub const Plan = struct {
++    base: usize,
++    compacted: bool = false,
++    moves: std.ArrayList(Move) = .empty,
++
++    pub fn deinit(p: *Plan, gpa: Allocator) void {
++        p.moves.deinit(gpa);
++    }
++
++    /// Called against original snapshot coordinates, only after ALL moves succeed.
++    pub fn relocated(p: *const Plan, r: Range) usize {
++        for (p.moves.items) |m| {
++            if ((Range{ .lo = m.from, .hi = m.from + m.len }).contains(r))
++                return m.to + (r.lo - m.from);
++        }
++        return r.lo;
++    }
++};
++
++fn gap(used: []const Range, size: usize, cap: usize, alignment: usize) ?usize {
++    if (size > cap) return null;
++    var base: usize = 0;
++    while (base <= cap - size) {
++        var past: ?usize = null;
++        for (used) |r| if (r.overlaps(.{ .lo = base, .hi = base + size })) {
++            past = @max(past orelse 0, r.hi);
++        };
++        if (past) |n| base = std.mem.alignForward(usize, n, alignment) else return base;
++    }
++    return null;
++}
++
++/// Cold admission gets the same preservation guarantee as restore: use a gap,
++/// or compact idle extents before considering eviction. Active coordinates never
++/// move. Null with active lanes means wait for them, not discard their neighbors.
++pub fn allocate(gpa: Allocator, cap: usize, alignment: usize, live: []const Range, snapshots: []const Range, size: usize) !?Plan {
++    if (size > cap) return null;
++    var used: std.ArrayList(Range) = .empty;
++    defer used.deinit(gpa);
++    try used.appendSlice(gpa, live);
++    try used.appendSlice(gpa, snapshots);
++    if (gap(used.items, size, cap, alignment)) |base| return .{ .base = base };
++    if (live.len != 0) return null;
++    std.mem.sort(Range, used.items, {}, Range.less);
++    var n: usize = 0;
++    for (used.items) |r| {
++        if (r.lo >= r.hi or r.hi > cap or r.lo % alignment != 0 or r.hi % alignment != 0) return error.BadLayout;
++        if (n > 0 and r.lo < used.items[n - 1].hi) {
++            used.items[n - 1].hi = @max(used.items[n - 1].hi, r.hi);
++        } else {
++            used.items[n] = r;
++            n += 1;
++        }
++    }
++    var p: Plan = .{ .base = 0, .compacted = true };
++    errdefer p.deinit(gpa);
++    var cursor: usize = 0;
++    for (used.items[0..n]) |r| {
++        cursor = std.mem.alignForward(usize, cursor, alignment);
++        const len = r.hi - r.lo;
++        if (cursor > cap or len > cap - cursor) {
++            p.deinit(gpa);
++            return null;
++        }
++        // Sorted groups compact left, so executing in this order preserves all
++        // yet-to-be-moved source rows. CopyParts handles an individual overlap.
++        if (cursor != r.lo) try p.moves.append(gpa, .{ .from = r.lo, .to = cursor, .len = len });
++        cursor += len;
++    }
++    cursor = std.mem.alignForward(usize, cursor, alignment);
++    if (cursor > cap or size > cap - cursor) {
++        p.deinit(gpa);
++        return null;
++    }
++    p.base = cursor;
++    return p;
++}
++
++pub const Retained = struct { range: Range, used: u64 };
++
++/// Alias checkpoints share physical rows. Their group is as recent as its most
++/// recently used member; deleting an old alias alone does not free those rows.
++pub fn oldestGroup(gpa: Allocator, snapshots: []const Retained, pinned: []const Range) !?Range {
++    const groups = try gpa.dupe(Retained, snapshots);
++    defer gpa.free(groups);
++    std.mem.sort(Retained, groups, {}, struct {
++        fn less(_: void, a: Retained, b: Retained) bool {
++            return Range.less({}, a.range, b.range);
++        }
++    }.less);
++    var n: usize = 0;
++    for (groups) |r| {
++        if (n > 0 and r.range.lo < groups[n - 1].range.hi) {
++            groups[n - 1].range.hi = @max(groups[n - 1].range.hi, r.range.hi);
++            groups[n - 1].used = @max(groups[n - 1].used, r.used);
++        } else {
++            groups[n] = r;
++            n += 1;
++        }
++    }
++    var best: ?Retained = null;
++    for (groups[0..n]) |r| {
++        const protected = for (pinned) |p| {
++            if (p.overlaps(r.range)) break true;
++        } else false;
++        if (!protected and (best == null or r.used < best.?.used)) best = r;
++    }
++    return if (best) |r| r.range else null;
++}
++
++test "cold allocation compacts three idle branches and preserves every alias token" {
++    const gpa = std.testing.allocator;
++    const saved = [_]Range{ .{ .lo = 4, .hi = 10 }, .{ .lo = 4, .hi = 7 }, .{ .lo = 14, .hi = 21 }, .{ .lo = 25, .hi = 30 } };
++    var p = (try allocate(gpa, 32, 1, &.{}, &saved, 12)).?;
++    defer p.deinit(gpa);
++    try std.testing.expect(p.compacted);
++    try std.testing.expectEqual(@as(usize, 18), p.base);
++    var data: [32]u32 = undefined;
++    for (&data, 0..) |*v, i| v.* = @intCast(11 * i + 7);
++    const original = data;
++    for (p.moves.items) |m| {
++        var parts = CopyParts.init(m.from, m.to, m.len);
++        while (parts.next()) |part| @memcpy(data[part.to..][0..part.len], data[part.from..][0..part.len]);
++    }
++    for (saved) |r| {
++        const at = p.relocated(r);
++        try std.testing.expectEqualSlices(u32, original[r.lo..r.hi], data[at..][0 .. r.hi - r.lo]);
++        try std.testing.expect(!(Range{ .lo = p.base, .hi = p.base + 12 }).overlaps(.{ .lo = at, .hi = at + r.hi - r.lo }));
++    }
++}
++
++test "cold allocation waits rather than moving active rows or evicting retained neighbors" {
++    const saved = [_]Range{ .{ .lo = 0, .hi = 8 }, .{ .lo = 16, .hi = 24 } };
++    try std.testing.expect((try allocate(std.testing.allocator, 32, 1, &.{.{ .lo = 0, .hi = 16 }}, &saved, 12)) == null);
++    var p = (try allocate(std.testing.allocator, 32, 1, &.{}, &saved, 12)).?;
++    defer p.deinit(std.testing.allocator);
++    try std.testing.expectEqual(@as(usize, 16), p.base);
++}
++
++test "real 573K plus 125K and 138K budgets fit at 32K but not 256K" {
++    const gpa = std.testing.allocator;
++    const idle = [_]Range{ .{ .lo = 606208, .hi = 729088 }, .{ .lo = 729088, .hi = 866304 } };
++    var p = (try allocate(gpa, 1048576, 2048, &.{}, &idle, 606208)).?;
++    defer p.deinit(gpa);
++    try std.testing.expect((try allocate(gpa, 1048576, 2048, &.{}, &idle, 829440)) == null);
++}
++
++test "physical group recency protects hot aliases and pinned source" {
++    const gpa = std.testing.allocator;
++    const saved = [_]Retained{
++        .{ .range = .{ .lo = 0, .hi = 2 }, .used = 1 },
++        .{ .range = .{ .lo = 0, .hi = 8 }, .used = 100 },
++        .{ .range = .{ .lo = 8, .hi = 16 }, .used = 10 },
++        .{ .range = .{ .lo = 16, .hi = 24 }, .used = 20 },
++    };
++    const victim = (try oldestGroup(gpa, &saved, &.{.{ .lo = 8, .hi = 16 }})).?;
++    try std.testing.expectEqual(@as(usize, 16), victim.lo);
++    try std.testing.expectEqual(@as(usize, 24), victim.hi);
++    try std.testing.expect((try oldestGroup(gpa, saved[0..2], &.{.{ .lo = 0, .hi = 2 }})) == null);
++}
++
++test "exhaustive cold placement preserves data and admits every fitting aligned two-group layout" {
++    const gpa = std.testing.allocator;
++    for (0..9) |a0| for (1..7) |alen| for (0..17) |b0| for (1..7) |blen| {
++        const a: Range = .{ .lo = a0, .hi = a0 + alen };
++        const b: Range = .{ .lo = b0, .hi = b0 + blen };
++        if (a.overlaps(b)) continue;
++        const saved = [_]Range{ a, b, .{ .lo = a0, .hi = a0 + 1 } };
++        const size = 32 - alen - blen;
++        var p = (try allocate(gpa, 32, 1, &.{}, &saved, size)).?;
++        defer p.deinit(gpa);
++        var data: [32]u32 = undefined;
++        for (&data, 0..) |*v, i| v.* = @intCast(i * 29);
++        const original = data;
++        for (p.moves.items) |m| {
++            var parts = CopyParts.init(m.from, m.to, m.len);
++            while (parts.next()) |part| @memcpy(data[part.to..][0..part.len], data[part.from..][0..part.len]);
++        }
++        for (saved) |r| {
++            const base = p.relocated(r);
++            try std.testing.expectEqualSlices(u32, original[r.lo..r.hi], data[base..][0 .. r.hi - r.lo]);
++            try std.testing.expect(!(Range{ .lo = p.base, .hi = p.base + size }).overlaps(.{ .lo = base, .hi = base + r.hi - r.lo }));
++        }
++    };
++}
++
++/// First allow the selected source and its contained aliases to move over their
++/// own old rows; every unrelated snapshot and every live lane remains reserved.
++/// If that cannot fit and no lanes are live, compact disjoint retained groups in
++/// their existing order, expanding the source group's reservation for this request.
++pub fn restore(gpa: Allocator, cap: usize, alignment: usize, live: []const Range,
++    snapshots: []const Range, source: Range, size: usize) !?Plan
++{
++    if (source.lo >= source.hi or source.hi > cap or size < source.hi - source.lo or size > cap)
++        return error.BadLayout;
++    var used: std.ArrayList(Range) = .empty;
++    defer used.deinit(gpa);
++    try used.appendSlice(gpa, live);
++    for (snapshots) |r| if (!source.contains(r)) try used.append(gpa, r);
++    if (gap(used.items, size, cap, alignment)) |base| {
++        var p: Plan = .{ .base = base };
++        errdefer p.deinit(gpa);
++        if (base != source.lo) try p.moves.append(gpa, .{ .from = source.lo, .to = base, .len = source.hi - source.lo });
++        return p;
++    }
++    // Active lane coordinates never change here. Wait/legacy capacity handling
++    // remains responsible for layouts that require moving live data.
++    if (live.len != 0) return null;
++    var groups: std.ArrayList(Range) = .empty;
++    defer groups.deinit(gpa);
++    try groups.appendSlice(gpa, snapshots);
++    std.mem.sort(Range, groups.items, {}, Range.less);
++    var n: usize = 0;
++    for (groups.items) |r| {
++        if (n > 0 and r.lo < groups.items[n - 1].hi) {
++            groups.items[n - 1].hi = @max(groups.items[n - 1].hi, r.hi);
++        } else {
++            groups.items[n] = r;
++            n += 1;
++        }
++    }
++    groups.items.len = n;
++    const source_index = for (groups.items, 0..) |r, i| {
++        if (r.lo == source.lo and r.hi == source.hi) break i;
++    } else return null; // a longer fork overlaps the source: it cannot be expanded in place
++
++    var proposed: std.ArrayList(Move) = .empty;
++    defer proposed.deinit(gpa);
++    var cursor: usize = 0;
++    var base: usize = 0;
++    for (groups.items, 0..) |r, i| {
++        const reserved = if (i == source_index) size else r.hi - r.lo;
++        cursor = std.mem.alignForward(usize, cursor, alignment);
++        if (cursor > cap or reserved > cap - cursor) return null;
++        if (i == source_index) base = cursor;
++        try proposed.append(gpa, .{ .from = r.lo, .to = cursor, .len = r.hi - r.lo });
++        cursor += reserved;
++    }
++    var p: Plan = .{ .base = base, .compacted = true };
++    errdefer p.deinit(gpa);
++    // Order-preserving layout: left moves from low to high, right moves from high
++    // to low. A copy must not destroy the original rows of a group not yet moved.
++    for (proposed.items) |m| if (m.to < m.from) try p.moves.append(gpa, m);
++    var i = proposed.items.len;
++    while (i > 0) {
++        i -= 1;
++        const m = proposed.items[i];
++        if (m.to > m.from) try p.moves.append(gpa, m);
++    }
++    return p;
++}
++
++/// CUDA memcpy calls must have disjoint source/destination ranges. Splitting an
++/// overlapping move into displacement-sized pieces gives memmove semantics when
++/// queued in order on the SAME stream, without extra GPU allocation.
++pub const CopyParts = struct {
++    from: usize,
++    to: usize,
++    len: usize,
++    left: usize,
++
++    pub fn init(from: usize, to: usize, len: usize) CopyParts {
++        return .{ .from = from, .to = to, .len = len, .left = if (from == to) 0 else len };
++    }
++
++    pub fn next(p: *CopyParts) ?Move {
++        if (p.left == 0) return null;
++        const distance = @max(p.from, p.to) - @min(p.from, p.to);
++        const len = @min(p.left, distance);
++        const offset = if (p.to > p.from) p.left - len else p.len - p.left;
++        p.left -= len;
++        return .{ .from = p.from + offset, .to = p.to + offset, .len = len };
++    }
++};
++
++test "copy parts preserve exact data for both overlapping directions and disjoint copies" {
++    for (0..32) |from| for (0..32) |to| for (0..33 - @max(from, to)) |len| {
++        var actual: [32]u32 = undefined;
++        for (&actual, 0..) |*v, i| v.* = @intCast(i * 97 + 13);
++        var expected = actual;
++        const original = actual;
++        @memcpy(expected[to..][0..len], original[from..][0..len]);
++        var parts = CopyParts.init(from, to, len);
++        while (parts.next()) |m| {
++            try std.testing.expect(m.from + m.len <= m.to or m.to + m.len <= m.from);
++            @memcpy(actual[m.to..][0..m.len], actual[m.from..][0..m.len]);
++        }
++        try std.testing.expectEqualSlices(u32, &expected, &actual);
++    };
++}
++
++test "444K A plus 32K reservation keeps adjacent 190K B by shifting B instead of evicting it" {
++    const a: Range = .{ .lo = 0, .hi = 442368 };
++    const b: Range = .{ .lo = 442368, .hi = 630784 };
++    var p = (try restore(std.testing.allocator, 1048576, 2048, &.{}, &.{ a, b }, a, 477184)).?;
++    defer p.deinit(std.testing.allocator);
++    try std.testing.expect(p.compacted);
++    try std.testing.expectEqual(@as(usize, 0), p.base);
++    try std.testing.expectEqual(@as(usize, 477184), p.relocated(b));
++    try std.testing.expectEqual(@as(usize, 1), p.moves.items.len);
++    try std.testing.expectEqual(@as(usize, 188416), p.moves.items[0].len);
++}
++
++test "source near the pool end moves over itself with its shorter checkpoints and keeps B" {
++    const a: Range = .{ .lo = 606208, .hi = 1048576 };
++    const older: Range = .{ .lo = a.lo, .hi = a.lo + 425984 };
++    const b: Range = .{ .lo = 0, .hi = 188416 };
++    var p = (try restore(std.testing.allocator, 1048576, 2048, &.{}, &.{ a, older, b }, a, 477184)).?;
++    defer p.deinit(std.testing.allocator);
++    try std.testing.expect(!p.compacted);
++    try std.testing.expectEqual(@as(usize, 188416), p.base);
++    try std.testing.expectEqual(p.base, p.relocated(older));
++    try std.testing.expectEqual(@as(usize, 0), p.relocated(b));
++}
++
++test "layout leaves live lanes and longer fork data reserved; real capacity shortages remain explicit" {
++    const a: Range = .{ .lo = 0, .hi = 8 };
++    const fork: Range = .{ .lo = 0, .hi = 12 };
++    const b: Range = .{ .lo = 8, .hi = 16 };
++    try std.testing.expect((try restore(std.testing.allocator, 20, 1, &.{b}, &.{ a, b }, a, 12)) == null);
++    try std.testing.expect((try restore(std.testing.allocator, 20, 1, &.{}, &.{ a, fork }, a, 12)) == null);
++    try std.testing.expect((try restore(std.testing.allocator, 18, 1, &.{}, &.{ a, b }, a, 12)) == null);
++}
++
++test "exhaustive small two-branch layouts preserve every retained token and aliases through expansion" {
++    const gpa = std.testing.allocator;
++    for (0..9) |a0| for (1..9) |alen| for (0..17) |b0| for (1..9) |blen| {
++        const a: Range = .{ .lo = a0, .hi = a0 + alen };
++        const b: Range = .{ .lo = b0, .hi = b0 + blen };
++        if (a.overlaps(b)) continue;
++        for (alen..17) |size| {
++            if (size + blen > 32) continue;
++            const alias: Range = .{ .lo = a.lo, .hi = a.lo + 1 };
++            var p = (try restore(gpa, 32, 1, &.{}, &.{ a, b, alias }, a, size)).?;
++            defer p.deinit(gpa);
++            var memory: [32]u32 = undefined;
++            for (&memory, 0..) |*v, i| v.* = @intCast(i + 100);
++            const original = memory;
++            for (p.moves.items) |move| {
++                var parts = CopyParts.init(move.from, move.to, move.len);
++                while (parts.next()) |m| @memcpy(memory[m.to..][0..m.len], memory[m.from..][0..m.len]);
++            }
++            for ([_]Range{ a, b, alias }) |r| {
++                const base = p.relocated(r);
++                try std.testing.expectEqualSlices(u32, original[r.lo..r.hi], memory[base..][0 .. r.hi - r.lo]);
++            }
++            try std.testing.expect(!(Range{ .lo = p.base, .hi = p.base + size }).overlaps(
++                .{ .lo = p.relocated(b), .hi = p.relocated(b) + blen }));
++        }
++    };
++}
++
++test "three retained groups survive mixed-direction compaction with exact contents" {
++    const gpa = std.testing.allocator;
++    var seed: u64 = 0x815673;
++    for (0..6000) |iteration| {
++        var ranges: [3]Range = undefined;
++        var end: usize = 0;
++        var total: usize = 0;
++        for (&ranges) |*r| {
++            seed = seed *% 6364136223846793005 +% 1442695040888963407;
++            const gap_: usize = @intCast((seed >> 32) % 3);
++            const len: usize = 1 + @as(usize, @intCast((seed >> 16) % 5));
++            r.* = .{ .lo = end + gap_, .hi = end + gap_ + len };
++            end = r.hi;
++            total += len;
++        }
++        const source_index = iteration % 3;
++        const source = ranges[source_index];
++        const maximum = 32 - (total - (source.hi - source.lo));
++        const size = source.hi - source.lo + iteration % (maximum - (source.hi - source.lo) + 1);
++        var plan = (try restore(gpa, 32, 1, &.{}, &ranges, source, size)).?;
++        defer plan.deinit(gpa);
++        var memory: [32]u32 = undefined;
++        for (&memory, 0..) |*v, i| v.* = @intCast(i * 71 + iteration);
++        const original = memory;
++        for (plan.moves.items) |m| {
++            var parts = CopyParts.init(m.from, m.to, m.len);
++            while (parts.next()) |part|
++                @memcpy(memory[part.to..][0..part.len], memory[part.from..][0..part.len]);
++        }
++        for (ranges, 0..) |r, i| {
++            const base = plan.relocated(r);
++            try std.testing.expectEqualSlices(u32, original[r.lo..r.hi], memory[base..][0 .. r.hi - r.lo]);
++            if (i != source_index) try std.testing.expect(!(Range{ .lo = plan.base, .hi = plan.base + size }).overlaps(
++                .{ .lo = base, .hi = base + r.hi - r.lo }));
++        }
++    }
++}
++
++test "overlapping source relocation never writes an active B reservation" {
++    const a: Range = .{ .lo = 24, .hi = 32 };
++    const b: Range = .{ .lo = 8, .hi = 16 };
++    var p = (try restore(std.testing.allocator, 32, 1, &.{b}, &.{ a, b }, a, 12)).?;
++    defer p.deinit(std.testing.allocator);
++    try std.testing.expectEqual(@as(usize, 16), p.base);
++    try std.testing.expectEqual(@as(usize, 8), p.relocated(b));
++    for (p.moves.items) |m| try std.testing.expect(!b.overlaps(.{ .lo = m.to, .hi = m.to + m.len }));
++}

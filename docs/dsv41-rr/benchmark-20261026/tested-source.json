@@ -1,0 +1,90 @@
+{
+  "base_commit": "0cc9bd84a022f4a5fc8698e62297750dbd491f8f",
+  "notice": "Published files retain existing attribution and add modification comments. Executable source is the tested version.",
+  "files": [
+    {
+      "path": "zig/src/core/engine_api.zig",
+      "base_sha256": "de4a06987bd16d1f0845e6caa4467c7556d83405e068e54a9e0f5a93ac841132",
+      "tested_sha256": "c9366eb594fea046fc511d7bdeb4a79e594873b834203982b10a8464a1095d8f",
+      "published_sha256": "fb25303388cb0d1a66b75b566e6a529857ba63271862804911aaab841b3a1111"
+    },
+    {
+      "path": "zig/src/core/lane_host.zig",
+      "base_sha256": "2a5cb756383298f9d6517bee1464ecc4659b7ecbfd4fd0a5cb1e6d2815a1f594",
+      "tested_sha256": "2aba40c793bd6306fde736178a0af574ee496cbea0f9c4c404a8915733491237",
+      "published_sha256": "91a7dfb30ca4fadf7974fa6c196e19e1550f1e20e0fd02f17fba26df9396a663"
+    },
+    {
+      "path": "zig/src/core/lane_host_prefill_test.zig",
+      "base_sha256": "ecf0ba962df9048498c854005cd994081cf1f50856291ab40b8b7c21f0024601",
+      "tested_sha256": "c4beb6575ea57a183be7d3eab3bae443349948e0bb32545c336f608fa289e6e7",
+      "published_sha256": "d21d9f12393ee58848c08ec16307a9dc740978234a000c6c052be73c782d04ee"
+    },
+    {
+      "path": "zig/src/core/lane_host_reuse_test.zig",
+      "base_sha256": "a1543c4853c140cd52b786f41f5d3b9002f44ac28ac52a61d702a926e885fe3f",
+      "tested_sha256": "424f5f15a55f72fccbd0f525283d9fcf002b20b86c11a12a174ce895ef2f88d2",
+      "published_sha256": "2ce14dcdf7c656d941514e382fa2a51f0578584a6e7088d0e5d80027f6c15605"
+    },
+    {
+      "path": "zig/src/core/prompt_cache.zig",
+      "base_sha256": "b2b8e19f23f1ada03be6c73a4d5fa9b573d6914cc7896cf4bd568e280d45d3d8",
+      "tested_sha256": "fbca999688ef6141d37cc35cb16a98386999d90b04804c7ff264039c5f97e8a0",
+      "published_sha256": "6403a743ce0d9c8b03eebefb9dbe78c434ccd22147f2b1713123814836da0774"
+    },
+    {
+      "path": "zig/src/core/prompt_cache_test.zig",
+      "base_sha256": "bc4b15c672f48b7972447816b812f009d6121490b9c9297af74abba438af8a89",
+      "tested_sha256": "bfcd7444d81d3d9ac86feb9492f2df772b679b49ba46fb19f8357105c477d73a",
+      "published_sha256": "f05a4e1c9688a7f9cbc3aa26485e1f67c8b2460b2f376cf6e720480f4890a93b"
+    },
+    {
+      "path": "zig/src/families/dsv41/lanes.zig",
+      "base_sha256": "fcda5f64cb4b4c4deea44bd62dc9c068bbb8dd3bcf5dc5073a54d78ffdbd211e",
+      "tested_sha256": "e2c66317159b1aa8e69a83b11e2a078cc3f565d9eb046cc612753d09a1c1a5fa",
+      "published_sha256": "acbbec3022f8d6a6dc9bc3f745838207315216b17530b4e4d57cb4a989804b33"
+    },
+    {
+      "path": "zig/src/families/dsv41/model.zig",
+      "base_sha256": "bff7777e8cd7c7ec35543b6fb96984b805c5aef9d0777615a0ce518a7764d295",
+      "tested_sha256": "cad55ae35bfaaeff0c70514793c18baeadd99c8727a9bbc342080c587265aff5",
+      "published_sha256": "19b5578fcbcd1a2ec15972c09ff5ae16ec1e339b17d99416bc8497aff084c215"
+    },
+    {
+      "path": "zig/src/families/dsv41/native.zig",
+      "base_sha256": "145456ac7d812c6959f862b1736dd06e8b5b55e5ff5f7094c3b72511bb394f86",
+      "tested_sha256": "9b9e1378db57cfee34f22c2d24ef01aa1c1d017b79997f5060f472f2a54ce9d9",
+      "published_sha256": "20e74487f897b65e1e0220307d3aed0fe1e70b4f7040de9fc4bec63213893de6"
+    },
+    {
+      "path": "zig/src/native/cuda.zig",
+      "base_sha256": "518238af16f07b5070ef80eb028928d02bb6897291a5bf8fe3822ee0e01e9b79",
+      "tested_sha256": "853954580cd3c2f91bbd5b606f592f4184a7708c2910275149959fe65c07fe5f",
+      "published_sha256": "5839344d06d144c5be8315d9dec55ffde63752bdbc7058c00a54f576c5d12fcf"
+    },
+    {
+      "path": "zig/src/server/dashboard.html",
+      "base_sha256": "fdf1272c548e7333b97dd529b21604bd9183f5fb23cdcf5a6a28d5243c719ec8",
+      "tested_sha256": "a62a06a59a2a26c32d5a4d5038551697ad10a83f475c64dacbbe0e82b5d0dc0c",
+      "published_sha256": "b1834a955a6f92d6dfeefb1ef6f761785a1df7b244a4290c4a2438f55c1d4b1e"
+    },
+    {
+      "path": "zig/src/server/metrics.zig",
+      "base_sha256": "3a59eb222c3a04fcdd8d5bfa9109e9173a33843e11fdb2a88385d8712edc7a65",
+      "tested_sha256": "cc3876036282e9d9922379601a613b406847ab6ef9967798f0bb7a5a0864cf4e",
+      "published_sha256": "454c3191db55b0b41e77297c4425cde15143435aa18f799ce42b4906022e9d48"
+    },
+    {
+      "path": "zig/src/server/status_routes.zig",
+      "base_sha256": "507b40a0e613aa4ca697101a43ce2f3a5e21c183a1a813d3ac505474a08fa47f",
+      "tested_sha256": "fc9f2d4889c31e8692f5640130e879a2bb81e0938d3f3564f8af53dd97a15f37",
+      "published_sha256": "d62c019b45428ccff925632229bf3419c9caf52385df4de180ada050565bab05"
+    },
+    {
+      "path": "zig/src/families/dsv41/pool_layout.zig",
+      "base_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tested_sha256": "d3aed85eb3d95a2e60e020a7aa7b3f1e59b050fac349c8db2eef9d50f71b23fd",
+      "published_sha256": "559a3b79890d93e585fe901bcf481bc96261a4d2b3aca6c0f5a4fe6494f1a23f"
+    }
+  ]
+}
